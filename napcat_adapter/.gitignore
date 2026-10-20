@@ -1,0 +1,5 @@
+.config/
+.artifacts/
+dist/
+build/
+*.spec
