@@ -4,9 +4,11 @@ import ast
 import json
 import subprocess
 
-from config import MODEL,WORKDIR,ENVIRONMENT_PROMPT
-from client import client
-from hooks import *
+from .config import MODEL,WORKDIR,ENVIRONMENT_PROMPT
+from .client import client
+from .hooks import *
+
+from napcat_adapter.agent_api import send_message
 
 # ===========================工具===========================
 # 基本工具
@@ -132,6 +134,7 @@ def run_edit(path, old_text, new_text):
     except Exception as e:
         return f"Error: {e}"
 
+# 文件搜索工具
 BASE_TOOLS.append({
     "type":"function",
     "function":{
@@ -224,6 +227,7 @@ class TodoManager:
 
 TODO = TodoManager()
 
+# 任务拆解工具
 ADVANCED_TOOLS.append({
     "type":"function",
     "function":{
@@ -263,13 +267,8 @@ def run_todo_write(todos):
     print(f"当前任务列表：\n{output}")
     return output
 
-# 工具分发
-BASE_TOOL_HANDLERS = {
-    "bash": run_bash, 
-    "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
-}
 
+# 子agent工具
 ADVANCED_TOOLS.append({
     "type":"function",
     "function":{
@@ -329,6 +328,7 @@ def run_subagent(prompt):
         messages.extend(results)
     return "子代理在30轮后停止，未给出最终答案。"
 
+# 上下文压缩工具
 ADVANCED_TOOLS.append({
     "type":"function",
     "function":{
@@ -342,10 +342,40 @@ ADVANCED_TOOLS.append({
 })
 '''该工具的函数体在context.py中，须在主循环中实现'''
 
+# 发送QQ消息工具
+ADVANCED_TOOLS.append({
+    "type":"function",
+    "function":{
+        "name":"send_QQ_message",
+        "description":"发送一条QQ消息到指定 qid 的私聊/群聊中",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "message_type":{"type":"string", "enum":["private", "group"]},
+                "qid":{"type":"string","enum":["2162075257","123456"]},
+                "message":{"type":"string","minLength":1}
+            },
+            "required":["message_type", "qid", "message"]
+        }
+    }
+})
+def run_send(message_type, qid, message):
+    send_message(
+        message_type=message_type,
+        user_id=qid,
+        message=message
+        )
 
+# 工具分发
+BASE_TOOL_HANDLERS = {
+    "bash": run_bash, 
+    "read_file": run_read, "write_file": run_write,
+    "edit_file": run_edit, "glob": run_glob,
+}
 ADVANCED_TOOL_HANDLERS = {
     "todo_write":run_todo_write,
-    "task":run_subagent
+    "task":run_subagent,
+    "send_QQ_message":run_send
 }
 
 MAIN_AGENT_TOOLS = [*BASE_TOOLS, *ADVANCED_TOOLS]

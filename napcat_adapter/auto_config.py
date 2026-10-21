@@ -56,14 +56,24 @@ def server_url(server):
             not isinstance(port, int) or not 1 <= port <= 65535):
         return None
     # 未指定监听地址映射为可连接的回环地址。
-    host = "[::1]" if host in ("::", "::1") else "127.0.0.1"
+    # localhost 可能只绑定 IPv6，保留名称让连接器解析，不能强制改为 IPv4。
+    host = "localhost" if host == "localhost" else "[::1]" if host in ("::", "::1") else "127.0.0.1"
     return f"ws://{host}:{port}"
+
+
+def _account_configs(directory):
+    return sorted((path.resolve() for path in directory.glob("onebot11_*.json") if path.is_file()), key=str)
 
 
 def find_configs(saved="", roots=None):
     """有限深度搜索常见目录；多账号不自动选中。"""
     if saved and Path(saved).is_file():
-        return [Path(saved).resolve()]
+        selected = Path(saved).resolve()
+        if selected.name == "onebot11.json":
+            accounts = _account_configs(selected.parent)
+            if accounts:
+                return accounts
+        return [selected]
     roots = roots if roots is not None else [
         os.getenv("NAPCAT_CONFIG_DIR", ""), Path.cwd() / "NapCat", Path.cwd() / "napcat",
         Path.cwd().parent / "NapCat", Path.home() / "Desktop" / "NapCat",
@@ -111,6 +121,8 @@ def _free_port(excluded=()):
 
 def configure_local(path):
     path, original, data = _read(path)
+    if path.name == "onebot11.json" and _account_configs(path.parent):
+        raise ValueError("默认模板不会覆盖已有账号配置；请选择正在使用的 onebot11_账号.json 配置文件")
     updated = copy.deepcopy(data)
     servers = updated["network"].setdefault("websocketServers", [])
     used_ports = {item.get("port") for key in ("websocketServers", "httpServers", "httpSseServers")
@@ -120,20 +132,21 @@ def configure_local(path):
     if len(owned) > 1:
         raise ValueError("发现重复的适配器服务名，请先在 NapCat 中处理")
     reusable = [item for item in servers if item.get("enable") is True and
-                item.get("messagePostFormat") == "array" and server_url(item)]
+                item.get("messagePostFormat") == "array" and item.get("reportSelfMessage") is True
+                and item.get("enableForcePushEvent", True) is True and server_url(item)]
     if owned:
         server = owned[0]
         existing_url = server_url(server)
         port = server.get("port", 3001) if existing_url and server.get("enable") is True else _free_port(used_ports)
         server.update(enable=True, host="127.0.0.1", port=port, messagePostFormat="array",
-                      reportSelfMessage=False, enableForcePushEvent=True)
+                      reportSelfMessage=True, enableForcePushEvent=True)
         if not isinstance(server.get("token"), str) or not server["token"]:
             server["token"] = secrets.token_urlsafe(32)
     elif reusable:
         server = reusable[0]
     else:
         server = dict(name=SERVICE_NAME, enable=True, host="127.0.0.1", port=_free_port(used_ports),
-                      messagePostFormat="array", reportSelfMessage=False,
+                      messagePostFormat="array", reportSelfMessage=True,
                       token=secrets.token_urlsafe(32), enableForcePushEvent=True,
                       debug=False, heartInterval=30000)
         servers.append(server)

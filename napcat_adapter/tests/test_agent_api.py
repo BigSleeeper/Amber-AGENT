@@ -20,41 +20,85 @@ def message(group=20, text="群消息"):
 
 
 class ProcessApiTests(unittest.TestCase):
+    def test_public_receive_supports_immediate_local_polling(self):
+        from napcat_adapter import agent_api as api
+        with patch.object(api, "_get_client") as factory:
+            factory.return_value.napcat_receive.return_value = []
+            self.assertEqual(api.napcat_receive(), [])
+            factory.return_value.napcat_receive.assert_called_once_with()
+
+    def test_public_poke_requires_target_and_never_starts_for_invalid_params(self):
+        from napcat_adapter import agent_api as api
+        with patch.object(api, "_get_client") as factory:
+            for params in (dict(user_id=0), dict(user_id=10, group_id=-1),
+                           dict(user_id=10, target_id=True)):
+                self.assertEqual(json.loads(api.send_poke(**params))["status"], "not_sent")
+            with self.assertRaises(TypeError):
+                api.send_poke(group_id=20)
+        factory.assert_not_called()
+
+    def test_poke_client_passes_explicit_napcat_params(self):
+        client, transport = self.client()
+        for params in (dict(user_id="10", group_id="20"), dict(user_id="10", target_id="99")):
+            self.assertTrue(json.loads(client.send_poke(**params))["success"])
+            transport.send_request.assert_called_with(params, command_type="send_poke")
+
+    def test_full_raw_event_is_returned_as_content_dictionary(self):
+        raw = {"sender": {"role": "admin", "title": "头衔"},
+               "group_name": "测试群", "extension": {"value": [False, None]}}
+        batch = [dict(type="message", content=raw)]
+        client, _ = self.client([batch])
+        received = client.napcat_receive()
+        self.assertEqual(received, batch)
+        self.assertIsInstance(received[0]["content"], dict)
+
     def client(self, messages=()):
-        transport = types.SimpleNamespace(receive=Mock(side_effect=list(messages)),
-            send=Mock(return_value=dict(success=True, status="ok", message_id="456")), close=Mock())
+        transport = types.SimpleNamespace(napcat_receive=Mock(side_effect=list(messages)),
+            send_request=Mock(return_value=dict(success=True, status="ok", message_id="456")), close=Mock())
         return ProcessClient(transport=transport), transport
 
-    def test_receive_shape_and_local_wait(self):
-        client, transport = self.client([message(), None])
-        received = client.receive_message()
-        self.assertEqual(received["conversation_id"], "qq:group:20")
-        self.assertIn("群消息", received["content"])
-        self.assertIsNone(client.receive_message())
-        self.assertEqual(transport.receive.call_count, 2)
-        transport.receive.assert_called_with(1.0)
+    def test_receive_shape_and_empty_batch(self):
+        batch = [dict(type="message", content={"message": "群消息"}),
+                 dict(type="meta_event", content={"meta_event_type": "heartbeat"})]
+        client, transport = self.client([batch, []])
+        self.assertEqual(client.napcat_receive(), batch)
+        self.assertEqual(client.napcat_receive(), [])
+        self.assertEqual(transport.napcat_receive.call_count, 2)
+        transport.napcat_receive.assert_called_with()
 
-    def test_current_group_binding_and_no_cross_thread_target(self):
-        client, transport = self.client([message(), message(21)])
-        client.receive_message()
-        self.assertTrue(json.loads(client.send_message("回答"))["success"])
-        transport.send.assert_called_with("qq:group:20", "回答")
-        client.receive_message()
-        client.send_message("下一个群")
-        transport.send.assert_called_with("qq:group:21", "下一个群")
+    def test_explicit_targets_do_not_depend_on_received_messages_or_thread(self):
+        client, transport = self.client()
+        params = dict(message_type="group", group_id=20, message="回答", auto_escape=True)
+        self.assertTrue(json.loads(client.send_message(**params))["success"])
+        transport.send_request.assert_called_with(params)
         results = queue.Queue()
-        thread = threading.Thread(target=lambda: results.put(json.loads(client.send_message("不应发送"))))
+        private = dict(message_type="private", user_id=10,
+                       message=[dict(type="text", data=dict(text="私聊"))])
+        thread = threading.Thread(target=lambda: results.put(json.loads(client.send_message(**private))))
         thread.start()
         thread.join()
-        self.assertEqual(results.get()["status"], "not_sent")
-        self.assertEqual(transport.send.call_count, 2)
+        self.assertTrue(results.get()["success"])
+        transport.send_request.assert_called_with(private)
+        self.assertEqual(transport.send_request.call_count, 2)
 
-    def test_no_target_and_empty_text_never_send(self):
-        client, transport = self.client([message()])
-        self.assertEqual(json.loads(client.send_message("未接收"))["status"], "not_sent")
-        client.receive_message()
-        self.assertEqual(json.loads(client.send_message(" "))["status"], "not_sent")
-        transport.send.assert_not_called()
+    def test_missing_target_and_empty_message_never_send(self):
+        client, transport = self.client()
+        for params in (dict(message_type="group", message="无目标"),
+                       dict(message_type="private", group_id=20, message="无用户"),
+                       dict(message_type="group", group_id=20, message=" ")):
+            self.assertEqual(json.loads(client.send_message(**params))["status"], "not_sent")
+        with self.assertRaises(TypeError):
+            client.send_message("旧接口")
+        with self.assertRaises(TypeError):
+            client.send_message(message_type="group", group_id=20)
+        transport.send_request.assert_not_called()
+
+    def test_public_invalid_request_does_not_start_a_child(self):
+        from napcat_adapter import agent_api as api
+        with patch.object(api, "_get_client") as factory:
+            result = json.loads(api.send_message(message_type="group", message="缺少群号"))
+        self.assertEqual(result["status"], "not_sent")
+        factory.assert_not_called()
 
     def test_start_once_and_stop_once(self):
         from napcat_adapter import agent_api as api

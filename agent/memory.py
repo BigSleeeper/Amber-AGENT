@@ -3,8 +3,8 @@ import re
 import yaml,json
 from pathlib import Path
 
-from config import MODEL, SYSTEM, WORKDIR, MEMORY_DIR, MEMORY_INDEX
-from client import client
+from .config import MODEL, SYSTEM, WORKDIR, MEMORY_DIR, MEMORY_INDEX
+from .client import client
 
 '''
 "---"是yaml中的文档分割符, 一个yaml文件中可以有多个独立的yaml文档

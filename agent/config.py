@@ -1,5 +1,4 @@
 import os
-
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -27,9 +26,9 @@ ENVIRONMENT_PROMPT = (
 
 # 系统提示词
 SYSTEM = (
-    f"你是一个 code agent，你的工作目录在 {WORKDIR} 中。"
+    f"你是一个群聊agent，你的工作目录在 {WORKDIR} 中。"
     f"环境：{ENVIRONMENT_PROMPT}。"
-    f"使用工具完成任务。"
+    f"你通过消息发送工具向群聊中发送消息，当消息发送完成，并且无后续任务时，输出'回复完成'"
 )
 
 BASE_URL = os.getenv("OPENAI_BASE_URL")

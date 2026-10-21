@@ -9,13 +9,14 @@ import queue
 import sys
 import threading
 import time
+import uuid
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .client import NapCatAdapter
 from .panel_model import PanelModel, Settings
-from .protocol import send_result
+from .protocol import SYSTEM_CONVERSATION, send_result, validate_send_command
 from .auto_config import configure_local, find_configs, saved_token
 from .theme import FONT, apply_theme, palette_for, style_titlebar
 
@@ -111,10 +112,12 @@ class Panel:
                   not_sent="未发送", failed="发送失败", unknown="结果未知")
 
     def __init__(self, root, settings, emit, *, auto_connect=True, token=""):
-        self.root, self.settings, self.emit = root, settings, emit
+        self.root, self.settings = root, settings
+        self._external_emit = emit
+        self.emit = self.emit_event
         self.events = queue.SimpleQueue()
         self.network = Network(self.events)
-        self.model = PanelModel(settings, emit, self.network.submit)
+        self.model = PanelModel(settings, self.emit, self.network.submit)
         self.closing = False
         self.status = "stopped"
         self.setup_running = False
@@ -123,6 +126,7 @@ class Panel:
         self.colors = palette_for(settings.theme)
         self.current_page = "主界面"
         self.active_conversation = None
+        self.local_api_requests = {}
         root.title("NapCat 适配器")
         root.geometry("1440x900")
         root.minsize(1120, 740)
@@ -190,6 +194,11 @@ class Panel:
         self.timer = root.after(80, self.pump)
         if auto_connect:
             self.connect()
+
+    def emit_event(self, event):
+        if event.get("type") == "send_result":
+            self.console_api_event(event)
+        self._external_emit(event)
 
     def show(self, name):
         self.current_page = name
@@ -303,7 +312,7 @@ class Panel:
         ttk.Label(chat_panel, text="已启用聊天", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
         self.home_chat_type = tk.StringVar(value="全部")
         self.home_chat_filter = ttk.Combobox(chat_panel, textvariable=self.home_chat_type,
-                                            values=("全部", "群聊", "私聊"), state="readonly", width=8)
+                                            values=("全部", "群聊", "私聊", "完整接口"), state="readonly", width=8)
         self.home_chat_filter.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         self.home_chat_filter.bind("<<ComboboxSelected>>", lambda _: self.refresh())
         list_frame = ttk.Frame(chat_panel, style="CardBody.TFrame")
@@ -375,7 +384,7 @@ class Panel:
         self.chat_type = tk.StringVar(value="全部")
         ttk.Entry(controls, textvariable=self.search, width=28).pack(side="left")
         self.search.trace_add("write", lambda *_: self.refresh_chats())
-        box = ttk.Combobox(controls, textvariable=self.chat_type, values=("全部", "群聊", "私聊"), state="readonly", width=8)
+        box = ttk.Combobox(controls, textvariable=self.chat_type, values=("全部", "群聊", "私聊", "完整接口"), state="readonly", width=8)
         box.pack(side="left", padx=8)
         box.bind("<<ComboboxSelected>>", lambda _: self.refresh_chats())
         ttk.Button(controls, text="刷新群聊 / 好友", command=self.network.catalog).pack(side="right")
@@ -441,12 +450,13 @@ class Panel:
             self.connection_vars[key] = variable
             ttk.Entry(form, textvariable=variable, width=24, show="•" if key == "token" else "").grid(row=index, column=1, sticky="ew", pady=5)
         self.require_at = tk.BooleanVar(value=self.settings.connection["require_at"])
-        ttk.Checkbutton(form, text="仅接收 @机器人 的群消息", style="Card.TCheckbutton", variable=self.require_at).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(form, text="接收全部事件；按聊天配置启用和放行。", style="CardHint.TLabel").grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         controls = ttk.Frame(manual, style="CardBody.TFrame")
         controls.pack(fill="x", pady=(12, 0))
         ttk.Button(controls, text="保存配置", command=self.save_connection).pack(side="left")
         ttk.Button(controls, text="连接", style="Primary.TButton", command=self.connect).pack(side="left", padx=8)
         ttk.Button(controls, text="断开", command=self.network.stop).pack(side="left")
+        ttk.Button(manual, text="打开通用 API 控制台", command=self.open_api_console).pack(anchor="w", pady=(10, 0))
         logs = ttk.Frame(frame, style="Card.TFrame", padding=18)
         logs.pack(fill="both", expand=True)
         ttk.Label(logs, text="运行日志", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 10))
@@ -458,6 +468,107 @@ class Panel:
         self.log.configure(yscrollcommand=scrollbar.set)
         self.log.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+    def open_api_console(self):
+        """适配器自己的操作入口；不需要 Agent 注册或调用通用工具。"""
+        window = tk.Toplevel(self.root)
+        window.title("NapCat 通用 API")
+        window.geometry("780x650")
+        window.minsize(600, 480)
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="使用 NapCat 原生 action 和 JSON 参数；在聊天配置中启用“全部事件 / 通用 API”。").pack(anchor="w")
+        ttk.Label(frame, text="请求进入主界面的发送队列，沿用人工 / 自动放行设置。").pack(anchor="w", pady=(3, 12))
+        form = ttk.Frame(frame)
+        form.pack(fill="x")
+        action = tk.StringVar(value="get_login_info")
+        timeout = tk.StringVar(value=str(self.settings.connection["api_timeout"]))
+        stream = tk.StringVar(value="自动")
+        ttk.Label(form, text="action").pack(side="left")
+        ttk.Entry(form, textvariable=action).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Label(form, text="超时（秒）").pack(side="left")
+        ttk.Entry(form, textvariable=timeout, width=7).pack(side="left", padx=8)
+        ttk.Combobox(form, textvariable=stream, values=("自动", "单帧", "多帧"), state="readonly", width=6).pack(side="left")
+        ttk.Label(frame, text="params（JSON 对象）").pack(anchor="w", pady=(12, 4))
+        params = tk.Text(frame, height=7, wrap="word")
+        params.pack(fill="x")
+        params.insert("1.0", "{}")
+        path = tk.StringVar()
+        files = ttk.Frame(frame)
+        files.pack(fill="x", pady=10)
+        ttk.Button(files, text="保存完整响应为 JSONL…", command=lambda: path.set(
+            filedialog.asksaveasfilename(parent=window, defaultextension=".jsonl", filetypes=(("JSONL", "*.jsonl"),)) or path.get())).pack(side="left")
+        ttk.Entry(files, textvariable=path).pack(side="left", fill="x", expand=True, padx=8)
+        output = tk.Text(frame, height=10, wrap="word", state="disabled")
+        output.pack(fill="both", expand=True)
+        status = tk.StringVar(value="就绪；大文件下载建议选择 JSONL 文件，保留所有 Base64 分块。")
+        ttk.Label(frame, textvariable=status, wraplength=720).pack(anchor="w", pady=8)
+        submit = ttk.Button(frame, text="加入发送队列", style="Primary.TButton")
+        submit.pack(anchor="e")
+
+        def enqueue():
+            command = dict(type="call_api", request_id=uuid.uuid4().hex,
+                           conversation_id=SYSTEM_CONVERSATION, action=action.get(), params={})
+            stream_file = None
+            try:
+                if not self.model.enabled(SYSTEM_CONVERSATION):
+                    raise ValueError("请先在聊天配置中启用“全部事件 / 通用 API”")
+                command.update(params=json.loads(params.get("1.0", "end")), timeout=float(timeout.get()),
+                               stream={"自动": None, "单帧": False, "多帧": True}[stream.get()])
+                validate_send_command(command)
+                if path.get().strip():
+                    # 独占创建，避免控制台覆盖已有结果文件。
+                    stream_file = open(path.get().strip(), "x", encoding="utf-8")
+            except (ValueError, OSError) as exc:
+                status.set(str(exc))
+                return
+            record = dict(output=output, status=status, button=submit, file=stream_file, displayed=0, omitted=False)
+            self.local_api_requests[command["request_id"]] = record
+            submit.configure(state="disabled")
+            status.set("已加入发送队列；手动模式请在主界面选择完整接口并放行。")
+            self.model.enqueue(command)
+            if command["request_id"] in self.model.results:
+                self.console_api_event(self.model.results[command["request_id"]])
+            self.refresh()
+        submit.configure(command=enqueue)
+        return window
+
+    def console_api_event(self, event):
+        record = self.local_api_requests.get(event.get("request_id"))
+        if record is None:
+            return
+        final = event["type"] == "send_result"
+        value = event.get("response", event)
+        line = json.dumps(value, ensure_ascii=False) + "\n"
+        if record["file"] is not None:
+            try:
+                record["file"].write(line)
+                record["file"].flush()
+            except OSError as exc:
+                record["file"].close()
+                record["file"] = None
+                record["file_error"] = type(exc).__name__
+        if record["output"].winfo_exists():
+            widget = record["output"]
+            widget.configure(state="normal")
+            # 文件保留全部帧；窗口限制预览大小，避免大文件阻塞界面。
+            available = max(0, 100000 - record["displayed"])
+            widget.insert("end", line[:available])
+            record["displayed"] += min(len(line), available)
+            if len(line) > available and not record["omitted"]:
+                widget.insert("end", "\n[后续内容超出预览上限，请查看所选 JSONL 文件]\n")
+                record["omitted"] = True
+            widget.configure(state="disabled")
+            widget.see("end")
+            if final:
+                record["button"].configure(state="normal")
+                record["status"].set(event.get("error") or event.get("status", "unknown"))
+                if record.get("file_error"):
+                    record["status"].set("结果文件写入失败：" + record["file_error"])
+        if final:
+            if record["file"] is not None:
+                record["file"].close()
+            self.local_api_requests.pop(event.get("request_id"), None)
 
     def select_rows(self, tree, select):
         """仅选择当前列表中的行，不触发放行、发送或开启会话。"""
@@ -539,10 +650,10 @@ class Panel:
             self.setup_status.set("NapCat 已处理，但适配器设置保存失败，请检查目录权限。")
             return
         if result.changed:
-            self.setup_status.set("配置已写入并备份。请重启 NapCat 使服务生效，适配器将自动重连。")
+            self.setup_status.set("配置已写入并备份。请在 NapCat WebUI 保存配置或重启 NapCat，适配器将自动重连。")
             self.append_log("NapCat 配置已更新，备份：" + str(result.backup))
         else:
-            self.setup_status.set("已匹配现有服务，正在连接。")
+            self.setup_status.set("已读取现有服务配置，正在连接；若仍失败，请在 NapCat WebUI 保存配置或重启 NapCat。")
             self.append_log("已复用 NapCat 现有 WebSocket 服务。")
         if (self.status == "connected" and self.network.adapter is not None and
                 self.network.adapter.url == result.url and self.network.adapter.token == result.token):
@@ -665,7 +776,7 @@ class Panel:
         for conversation, record in self.settings.sessions.items():
             if not record["enabled"]:
                 continue
-            label = "群聊" if ":group:" in conversation else "私聊"
+            label = self.session_kind(conversation)
             if kind != "全部" and kind != label:
                 continue
             enabled.append((conversation, record, label))
@@ -682,7 +793,7 @@ class Panel:
         for index, (conversation, record, label) in enumerate(enabled):
             pending = counts[conversation]
             tags = (("odd",) if index % 2 else ()) + (("pending",) if any(pending) else ())
-            text = f"{('群' if label == '群聊' else '私')} · {self.chat_label(conversation)}"
+            text = f"{label} · {self.chat_label(conversation)}"
             values = (f"{pending[0]} / {pending[1]}",)
             if self.home_chats.exists(conversation):
                 self.home_chats.item(conversation, text=text, values=values, tags=tags)
@@ -700,7 +811,7 @@ class Panel:
             else:
                 self.home_chats.selection_remove(self.home_chats.selection())
         if self.active_conversation:
-            kind_label = "群聊" if ":group:" in self.active_conversation else "私聊"
+            kind_label = self.session_kind(self.active_conversation)
             self.active_chat_label.configure(text=f"{self.chat_label(self.active_conversation)}  ·  {kind_label}  {self.active_conversation.split(':')[-1]}")
         else:
             self.active_chat_label.configure(text="尚未启用聊天，请先在聊天配置中开启" if not any(item["enabled"] for item in self.settings.sessions.values()) else "当前分类没有已启用聊天")
@@ -712,7 +823,7 @@ class Panel:
         self.chats.delete(*self.chats.get_children())
         search, kind = self.search.get().casefold(), self.chat_type.get()
         for index, (key, record) in enumerate(sorted(self.settings.sessions.items())):
-            label = "群聊" if ":group:" in key else "私聊"
+            label = self.session_kind(key)
             if kind != "全部" and kind != label:
                 continue
             if search not in (key + record["name"]).casefold():
@@ -722,6 +833,10 @@ class Panel:
         self.chats.selection_set([key for key in selected if self.chats.exists(key)])
         self.show_empty(self.chats)
         self.update_chat_selection()
+
+    @staticmethod
+    def session_kind(conversation):
+        return "完整接口" if ":system:" in conversation else "群聊" if ":group:" in conversation else "私聊"
 
     def refresh(self):
         self.refresh_home_chats()
@@ -763,8 +878,17 @@ class Panel:
             event = row["event"]
             sender = event.get("metadata", {}).get("sender_name") or event.get("sender_id", "Agent")
             text = f"{event['conversation_id']} · {sender}\n{event['text']}"
+            if direction == "receive" and "raw_event" in event:
+                text += "\n\nNapCat 原始事件：\n" + json.dumps(
+                    event["raw_event"], ensure_ascii=False, indent=2)
+            if direction == "send" and "params" in event:
+                text += "\n\nNapCat 发送参数：\n" + json.dumps(
+                    event["params"], ensure_ascii=False, indent=2)
             if row.get("result", {}).get("error"):
                 text += "\n\n" + row["result"]["error"]
+            if "raw_response" in row.get("result", {}):
+                text += "\n\nNapCat 完整回执：\n" + json.dumps(
+                    row["result"]["raw_response"], ensure_ascii=False, indent=2)
         widget = self.details[direction]
         widget.configure(state="normal")
         widget.delete("1.0", "end")
@@ -803,11 +927,13 @@ class Panel:
                 self.setup_button.configure(state="normal")
                 self.setup_status.set("自动配置未完成：" + event["error"])
                 self.append_log("自动配置未完成：" + event["error"])
-            elif kind == "message":
+            elif kind in ("message", "notice", "event"):
                 self.model.receive(event)
             elif kind == "send_result":
                 self.model.complete(event)
-            elif kind == "send_started":
+            elif kind in ("send_started", "api_frame"):
+                if kind == "api_frame":
+                    self.console_api_event(event)
                 self.emit(event)
             elif kind == "status":
                 self.status = event["status"]

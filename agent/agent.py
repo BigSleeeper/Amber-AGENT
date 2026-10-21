@@ -1,11 +1,11 @@
 import json
 
-from client import create_completion
-from config import MODEL, SYSTEM
-from tools import *
-from hooks import *
-from context import COMPACTOR,MAX_REACTIVE_RETRIES
-from memory import *
+from .client import create_completion
+from .config import MODEL, SYSTEM
+from .tools import *
+from .hooks import *
+from .context import COMPACTOR,MAX_REACTIVE_RETRIES
+from .memory import *
 
 # 核心AGENT循环
 agent_cnt = [0,0]

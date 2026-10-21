@@ -3,8 +3,8 @@ import json
 from pathlib import Path
 import uuid
 
-from client import client
-from config import MODEL,TRANSCRIPT_DIR,TOOL_RESULTS_DIR
+from .client import client
+from .config import MODEL,TRANSCRIPT_DIR,TOOL_RESULTS_DIR
 
 '''
 根据函数功能层级，把函数分为三级

@@ -6,7 +6,8 @@ import logging
 import uuid
 from collections import OrderedDict
 
-from .protocol import normalize_event, parse_conversation, send_result
+from .protocol import (parse_conversation, raw_event_envelope,
+                       send_result, validate_send_command)
 
 
 LOG = logging.getLogger(__name__)
@@ -27,7 +28,8 @@ class NapCatAdapter:
         self.api_timeout, self.reconnect_delay = api_timeout, reconnect_delay
         self._ws = None
         self._pending = {}
-        self._seen = OrderedDict()
+        self._stream_handlers = {}
+        self._single_response = set()
         self._requests = OrderedDict()
         self._inflight = set()
         self._stopped = None
@@ -44,8 +46,8 @@ class NapCatAdapter:
             self._stopped.set()
             return
         request_id = command.get("request_id")
-        if command.get("type") != "send_message" or not isinstance(request_id, str) or not request_id:
-            self._emit({"type": "error", "error": "需要 send_message 和非空 request_id"})
+        if command.get("type") not in ("send_message", "send_poke", "call_api") or not isinstance(request_id, str) or not request_id:
+            self._emit({"type": "error", "error": "需要 send_message/send_poke/call_api 和非空 request_id"})
             return
         if request_id in self._requests:
             self._emit(self._requests[request_id])
@@ -60,15 +62,13 @@ class NapCatAdapter:
 
     async def _send(self, command, connection):
         try:
-            kind, target = parse_conversation(command.get("conversation_id"))
-            text = command.get("text")
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError("text 必须是非空字符串")
+            conversation, params = validate_send_command(command)
+            kind, target = parse_conversation(conversation)
             if kind == "group":
                 groups = self.options["allowed_groups"]
                 if groups is not None and target not in groups:
                     raise ValueError("目标群不在允许列表")
-            else:
+            elif kind == "private":
                 users = self.options["allowed_users"]
                 if self.options["group_only"] or (users is not None and target not in users):
                     raise ValueError("不允许向该私聊发送消息")
@@ -79,22 +79,33 @@ class NapCatAdapter:
         echo = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._pending[echo] = future
+        if command["type"] == "call_api":
+            self._stream_handlers[echo] = lambda response: self._emit(dict(
+                type="api_frame", request_id=command["request_id"], response=response))
+            # UploadFileStream 的每次分块请求仅返回一个 type=stream 回执。
+            # 下载流则有中间帧和 type=response 终帧；两者不能仅按 stream 标记区分。
+            if command.get("stream") is False or (command.get("stream") is None
+                                                  and command["action"] == "upload_file_stream"):
+                self._single_response.add(echo)
         try:
-            async with asyncio.timeout(self.api_timeout):
+            async with asyncio.timeout(command.get("timeout") or self.api_timeout):
                 await connection.send(json.dumps({
-                    "action": f"send_{kind}_msg", "echo": echo,
-                    "params": {
-                        "group_id" if kind == "group" else "user_id": target,
-                        "message": [{"type": "text", "data": {"text": text}}],
-                    },
+                    "action": (command["action"] if command["type"] == "call_api" else
+                               "send_poke" if command["type"] == "send_poke" else f"send_{kind}_msg"),
+                    "echo": echo,
+                    "params": params,
                 }, ensure_ascii=False))
                 response = await future
             if response.get("status") == "ok" and response.get("retcode") == 0:
-                return send_result(command, "ok", message_id=(response.get("data") or {}).get("message_id"))
-            if response.get("status") == "async":
-                return send_result(command, "unknown", error="接口已受理，尚无最终发送结果")
-            return send_result(command, "failed", error=str(
-                response.get("wording") or response.get("message") or response.get("retcode")))
+                data = response.get("data")
+                result = send_result(command, "ok", message_id=data.get("message_id") if isinstance(data, dict) else None)
+            elif response.get("status") == "async":
+                result = send_result(command, "unknown", error="接口已受理，尚无最终执行结果")
+            else:
+                result = send_result(command, "failed", error=str(
+                    response.get("wording") or response.get("message") or response.get("retcode")))
+            result.update(raw_response=response, data=response.get("data"))
+            return result
         except (TimeoutError, ConnectionError, OSError):
             return send_result(command, "unknown", error="未收到最终回执；不要自动重发")
         except Exception as exc:
@@ -102,6 +113,8 @@ class NapCatAdapter:
             return send_result(command, "unknown", error="发送结果未知；不要自动重发")
         finally:
             self._pending.pop(echo, None)
+            self._stream_handlers.pop(echo, None)
+            self._single_response.discard(echo)
             if not future.done():
                 future.cancel()
             elif not future.cancelled():
@@ -121,7 +134,7 @@ class NapCatAdapter:
                 response = await future
             if response.get("status") != "ok" or response.get("retcode") != 0:
                 raise ValueError("NapCat 查询失败")
-            return response.get("data") or []
+            return response.get("data")
         finally:
             self._pending.pop(echo, None)
             if not future.done():
@@ -133,9 +146,9 @@ class NapCatAdapter:
         while True:
             command, connection = await self._commands.get()
             try:
-                if self.report_progress:
+                if self.report_progress or command["type"] == "call_api":
                     self._emit(dict(type="send_started", request_id=command["request_id"],
-                                    timeout=self.api_timeout + 5))
+                                    timeout=(command.get("timeout") or self.api_timeout) + 5))
                 result = await self._send(command, connection)
                 request_id = command["request_id"]
                 self._requests[request_id] = result
@@ -156,20 +169,25 @@ class NapCatAdapter:
                 if isinstance(echo, str) and echo in self._pending:
                     future = self._pending[echo]
                     if not future.done():
-                        future.set_result(event)
+                        data = event.get("data")
+                        intermediate = (echo not in self._single_response
+                                        and event.get("stream") == "stream-action"
+                                        and isinstance(data, dict)
+                                        and data.get("type") in ("stream", "reset")
+                                        and event.get("status") == "ok" and event.get("retcode") == 0)
+                        if intermediate:
+                            handler = self._stream_handlers.get(echo)
+                            if handler is not None:
+                                handler(event)
+                        else:
+                            future.set_result(event)
                     continue
-                message = normalize_event(event, **self.options)
-                if message is None:
+                # 迟到/无匹配请求的 API 回执不作为上报事件交付。
+                if "post_type" not in event and "status" in event and "retcode" in event:
                     continue
-                key = (message["metadata"]["self_id"], message["conversation_id"], message["message_id"])
-                if key in self._seen:
-                    continue
-                self._seen[key] = None
-                if len(self._seen) > 4096:
-                    self._seen.popitem(last=False)
-                self._emit(message)
+                self._emit(raw_event_envelope(event))
             except (ValueError, TypeError, KeyError, AttributeError):
-                LOG.warning("忽略无法解析的 OneBot 事件，请检查 array 消息格式")
+                LOG.warning("忽略无法解析的 OneBot JSON 上报帧")
 
     async def _connect(self):
         from websockets.asyncio.client import connect
@@ -178,7 +196,7 @@ class NapCatAdapter:
         while not self._stopped.is_set():
             try:
                 async with connect(self.url, additional_headers=headers, proxy=None,
-                                   open_timeout=10, close_timeout=2) as ws:
+                                   open_timeout=10, close_timeout=2, max_size=50 * 1024 * 1024) as ws:
                     self._ws = ws
                     self._emit({"type": "status", "status": "connected"})
                     await self._receive(ws)

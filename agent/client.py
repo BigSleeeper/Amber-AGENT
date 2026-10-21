@@ -2,8 +2,8 @@ import time
 import openai
 from openai import OpenAI
 
-from utils import term
-from config import API_KEY, BASE_URL
+from .utils import term
+from .config import API_KEY, BASE_URL
 
 client = OpenAI(api_key = API_KEY, 
                 base_url = BASE_URL,

@@ -13,7 +13,9 @@ from collections import deque
 from pathlib import Path
 
 from .configuration import AdapterConfig
-from .protocol import parse_conversation, send_result
+from .protocol import (command_preview, parse_conversation, send_result,
+                       SYSTEM_CONVERSATION, validate_api_call, validate_poke_params,
+                       received_item, validate_send_command, validate_send_params)
 
 
 LOG = logging.getLogger(__name__)
@@ -34,7 +36,7 @@ class AdapterProcess:
         self._condition = threading.Condition()
         self._write_lock = threading.Lock()
         self._close_lock = threading.Lock()
-        self._messages = deque()
+        self._events = deque()
         self._pending = {}
         self._ready = False
         self._reader_done = False
@@ -42,6 +44,7 @@ class AdapterProcess:
         self._closed = False
         self.status = "starting"
         self.dropped_messages = 0
+        self.dropped_events = 0
         self._stderr_tail = deque(maxlen=5)
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
         self.process = subprocess.Popen(
@@ -97,16 +100,27 @@ class AdapterProcess:
             elif kind == "status":
                 self.status = event.get("status", "unknown")
                 LOG.info("NapCat 状态：%s", self.status)
-            elif kind == "message" and event.get("source") == "qq":
+            elif kind in ("event", "message", "notice") and event.get("source") == "qq":
+                if kind == "event" and not isinstance(event.get("raw_event"), dict):
+                    return
                 parse_conversation(event.get("conversation_id"))
                 if not isinstance(event.get("text"), str):
                     return
-                if len(self._messages) >= self.config.inbox_capacity:
+                if len(self._events) >= self.config.inbox_capacity:
                     self.dropped_messages += 1
+                    self.dropped_events += 1
                     if self.dropped_messages == 1 or self.dropped_messages % 100 == 0:
                         LOG.warning("NapCat 输入队列已满，累计丢弃 %d 条新消息", self.dropped_messages)
                 else:
-                    self._messages.append(event)
+                    self._events.append(event)
+            elif kind == "api_frame":
+                pending = self._pending.get(event.get("request_id"))
+                if pending is not None and isinstance(event.get("response"), dict):
+                    progress = pending[3]
+                    if len(progress["frames"]) < 128:
+                        progress["frames"].append(event["response"])
+                    else:
+                        progress["overflow"] = True
             elif kind in ("send_pending", "send_started"):
                 pending = self._pending.get(event.get("request_id"))
                 if pending is not None:
@@ -150,10 +164,25 @@ class AdapterProcess:
             self.process.stdin.flush()
 
     def receive(self, timeout=1.0):
-        """等待下一条已推送消息。超时仅用于主循环响应 Ctrl+C，不进行网络查询。"""
+        """内部单条 GUI 信封读取；与批量接口共用唯一接收队列。"""
+        return self._receive_queue(self._events, timeout)
+
+    def napcat_receive(self):
+        """立即取走当前全部已放行事件，按接收顺序返回列表；空队列返回 []。"""
+        with self._condition:
+            if not self._events and not self._closing and not self.alive:
+                raise AdapterProcessError("NapCat 适配器已退出，请检查日志后重新启动主程序")
+            batch = list(self._events)
+            self._events.clear()
+        return [received_item(event["raw_event"]) for event in batch]
+
+    def _receive_queue(self, events, timeout):
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout < 0):
+            raise ValueError("接收 timeout 必须为有限的非负秒数")
         deadline = time.monotonic() + timeout
         with self._condition:
-            while not self._messages:
+            while not events:
                 if self._closing:
                     return None
                 if self._reader_done or self.process.poll() is not None:
@@ -162,35 +191,98 @@ class AdapterProcess:
                 if remaining <= 0:
                     return None
                 self._condition.wait(min(remaining, 0.5))
-            return self._messages.popleft()
+            return events.popleft()
 
-    def send(self, conversation_id, text):
-        command = dict(type="send_message", request_id=uuid.uuid4().hex,
-                       conversation_id=conversation_id, text=text)
+    def send(self, conversation_id, message, **options):
+        """内部便捷接口；公共 Agent 接口须明确提供 NapCat 目标参数。"""
         try:
-            parse_conversation(conversation_id)
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError("text 必须是非空字符串")
+            kind, target = parse_conversation(conversation_id)
+        except ValueError as exc:
+            return send_result(dict(conversation_id=conversation_id), "not_sent", error=str(exc))
+        return self.send_request(dict(options, message_type=kind, message=message,
+                                      **{"group_id" if kind == "group" else "user_id": target}))
+
+    def send_request(self, params, *, command_type="send_message"):
+        command = dict(type=command_type, request_id=uuid.uuid4().hex, params=params)
+        try:
+            # 校验完整命令前，先从参数计算同一份路由目标。
+            validator = validate_poke_params if command_type == "send_poke" else validate_send_params
+            conversation, snapshot = validator(params)
+            command.update(conversation_id=conversation, params=snapshot)
+            validate_send_command(command)
         except ValueError as exc:
             return send_result(command, "not_sent", error=str(exc))
+        command["text"] = command_preview(command, snapshot)
+        return self._request(command)
+
+    def call_api(self, action, params=None, *, timeout=None, on_frame=None, stream=None):
+        params = {} if params is None else params
+        command = dict(type="call_api", request_id=uuid.uuid4().hex,
+                       conversation_id=SYSTEM_CONVERSATION, action=action, params=params,
+                       timeout=timeout, stream=stream)
+        try:
+            validate_api_call(action, params, timeout)
+            _, snapshot = validate_send_command(command)
+        except ValueError as exc:
+            return send_result(command, "not_sent", error=str(exc))
+        if on_frame is not None and not callable(on_frame):
+            return send_result(command, "not_sent", error="on_frame 必须是可调用对象")
+        command.update(params=snapshot, text=command_preview(command, snapshot))
+        return self._request(command, on_frame=on_frame)
+
+    def _request(self, command, *, on_frame=None):
         ready, result = threading.Event(), {}
+        frames, collected, frame_bytes = deque(), [], 0
+        callback_error = None
         request_id = command["request_id"]
         with self._condition:
             if not self.alive:
                 return send_result(command, "not_sent", error="适配器未运行")
-            progress = {"deadline": time.monotonic() + self.config.send_timeout}
+            initial_wait = ((command.get("timeout") or self.config.api_timeout) + 5
+                            if command["type"] == "call_api" else self.config.send_timeout)
+            progress = {"deadline": time.monotonic() + initial_wait,
+                        "frames": frames, "overflow": False}
             self._pending[request_id] = (ready, result, command, progress)
         try:
             self._write(command)
-            with self._condition:
-                while not ready.is_set():
+            while True:
+                with self._condition:
+                    batch = list(frames)
+                    frames.clear()
+                    finished = ready.is_set()
                     if self._closing:
                         return send_result(command, "unknown", error="适配器正在退出，发送结果未知；不要自动重发")
                     deadline = progress["deadline"]
                     remaining = None if deadline is None else deadline - time.monotonic()
-                    if remaining is not None and remaining <= 0:
+                    if not finished and remaining is not None and remaining <= 0:
                         return send_result(command, "unknown", error="等待发送回执超时；不要自动重发")
-                    self._condition.wait(0.5 if remaining is None else min(remaining, 0.5))
+                    if not batch and not finished:
+                        self._condition.wait(0.5 if remaining is None else min(remaining, 0.5))
+                        continue
+                # 用户回调在调用线程执行，不阻塞管道读取，也不持有条件锁。
+                for frame in batch:
+                    if callback_error is not None:
+                        continue
+                    if on_frame is not None:
+                        try:
+                            on_frame(frame)
+                        except Exception as exc:
+                            callback_error = f"流处理回调失败：{type(exc).__name__}"
+                    else:
+                        frame_bytes += len(json.dumps(frame, ensure_ascii=False).encode("utf-8"))
+                        if frame_bytes > 64 * 1024 * 1024:
+                            callback_error = "流数据超过 64 MiB，请使用 on_frame 逐帧处理"
+                        else:
+                            collected.append(frame)
+                if finished:
+                    break
+            if collected:
+                result["frames"] = collected
+            if callback_error or progress["overflow"]:
+                result["stream_error"] = callback_error or "流处理速度不足，待处理帧超过 128 条"
+                result["stream_complete"] = False
+            elif command["type"] == "call_api":
+                result["stream_complete"] = result.get("status") == "ok"
             return result
         except (OSError, ValueError):
             return send_result(command, "unknown", error="管道连接中断，发送结果未知；不要自动重发")

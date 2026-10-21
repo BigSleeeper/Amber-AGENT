@@ -36,7 +36,7 @@ def main():
     parser.add_argument("--allow-group", type=int, action="append")
     parser.add_argument("--allow-user", type=int, action="append")
     parser.add_argument("--group-only", action="store_true")
-    parser.add_argument("--require-at", action="store_true", help="默认接收全部群消息")
+    parser.add_argument("--require-at", action="store_true", help="兼容旧选项；统一接收不按 @ 过滤")
     parser.add_argument("--api-timeout", type=float, default=15)
     parser.add_argument("--reconnect-delay", type=float, default=3)
     parser.add_argument("--gui", action="store_true", help="显示三页管理界面")

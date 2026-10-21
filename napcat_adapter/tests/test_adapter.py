@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from napcat_adapter.client import NapCatAdapter
-from napcat_adapter.protocol import normalize_event
+from napcat_adapter.protocol import normalize_event, validate_poke_params, validate_send_params
 from napcat_adapter.ipc import AdapterProcess
 from napcat_adapter.configuration import AdapterConfig
 
@@ -18,11 +18,97 @@ def event(group=20, user=10, message_id=1, segments=None):
 
 
 def command(request_id="r1", conversation_id="qq:group:20", text="你好"):
+    parts = conversation_id.split(":")
+    kind = parts[1] if len(parts) == 3 else "group"
+    target = int(parts[2]) if len(parts) == 3 else 20
     return dict(type="send_message", request_id=request_id,
-                conversation_id=conversation_id, text=text)
+                conversation_id=conversation_id, text=text,
+                params=dict(message_type=kind, message=[dict(type="text", data=dict(text=text))],
+                            **{"group_id" if kind == "group" else "user_id": target}))
+
+
+def poke_event(group=20, user=10, target=99, sender=None):
+    raw = dict(post_type="notice", notice_type="notify", sub_type="poke",
+               self_id=99, time=123, user_id=user, target_id=target,
+               raw_info=[dict(type="nor", txt="拍了拍")], extension={"kept": True})
+    if group is not None:
+        raw["group_id"] = group
+    if sender is not None:
+        raw["sender_id"] = sender
+    return raw
+
+
+def poke_command(request_id="p1", group=20, user=10, target=None):
+    params = dict(user_id=user)
+    if group is not None:
+        params["group_id"] = group
+    if target is not None:
+        params["target_id"] = target
+    conversation = f"qq:group:{group}" if group is not None else f"qq:private:{user}"
+    return dict(type="send_poke", request_id=request_id, conversation_id=conversation, params=params)
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_poke_notice_preserves_fields_and_private_actor(self):
+        raw = poke_event()
+        notice = normalize_event(raw)
+        self.assertEqual(notice["type"], "notice")
+        self.assertEqual(notice["conversation_id"], "qq:group:20")
+        self.assertIsNone(notice["message_id"])
+        self.assertEqual(notice["raw_event"], raw)
+        raw["extension"]["kept"] = False
+        self.assertTrue(notice["raw_event"]["extension"]["kept"])
+        private = normalize_event(poke_event(group=None, sender=11))
+        self.assertEqual(private["conversation_id"], "qq:private:10")
+        self.assertEqual(private["sender_id"], "11")
+        self.assertEqual(private["metadata"]["target_id"], "99")
+
+    def test_poke_obeys_filters_without_requiring_message_segments(self):
+        self.assertIsNone(normalize_event(poke_event(), allowed_groups={21}))
+        self.assertIsNone(normalize_event(poke_event(), allowed_users={11}))
+        self.assertIsNone(normalize_event(poke_event(group=None), group_only=True))
+        self.assertIsNone(normalize_event(poke_event(group=None, sender=99, target=10)))
+        self.assertIsNone(normalize_event(poke_event(user=99, target=10)))
+        self.assertIsNone(normalize_event(poke_event(target=11), require_at=True))
+        self.assertIsNotNone(normalize_event(poke_event(), require_at=True))
+        self.assertIsNone(normalize_event(dict(poke_event(), notice_type="group_recall")))
+
+    def test_invalid_poke_params_are_rejected_and_explicit_target_is_preserved(self):
+        for params in (None, {}, dict(user_id=True), dict(user_id=0), dict(user_id="bad"),
+                       dict(user_id=10, group_id=0), dict(user_id=10, target_id=-1),
+                       dict(user_id=10, message="not a poke field")):
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                validate_poke_params(params)
+        conversation, params = validate_poke_params(dict(user_id="10", target_id="99"))
+        self.assertEqual(conversation, "qq:private:10")
+        self.assertEqual(params["target_id"], "99")
+
+    def test_missing_or_invalid_send_fields_are_rejected(self):
+        valid = dict(message_type="group", group_id=20,
+                     message=[dict(type="text", data=dict(text="你好"))])
+        invalid = [None, {}, dict(valid, message_type="other"), dict(valid, group_id=None),
+                   dict(valid, group_id=True), dict(valid, group_id=1.5), dict(valid, group_id=0),
+                   dict(valid, user_id=10), dict(valid, message=None), dict(valid, message=[]),
+                   dict(valid, message=" "), dict(valid, message=[dict(type="image")]),
+                   dict(valid, auto_escape=1), dict(valid, extra=float("nan"))]
+        for params in invalid:
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                validate_send_params(params)
+
+    def test_complete_raw_event_including_unknown_nested_fields_is_preserved(self):
+        raw = dict(event(), group_name="测试群", message_seq=52, real_seq="53",
+                   raw_message="你好", message_format="array", font=14,
+                   extension={"items": [None, False, {"value": "扩展"}]})
+        raw["sender"].update(role="admin", title="头衔", custom=42)
+        normalized = normalize_event(raw)
+        self.assertEqual(normalized["raw_event"], raw)
+        raw["sender"]["role"] = "member"
+        raw["extension"]["items"].append("later")
+        normalized["metadata"]["segments"][0]["data"]["text"] = "changed"
+        self.assertEqual(normalized["raw_event"]["sender"]["role"], "admin")
+        self.assertEqual(len(normalized["raw_event"]["extension"]["items"]), 3)
+        self.assertEqual(normalized["raw_event"]["message"][0]["data"]["text"], "你好")
+
     def test_group_shared_conversation(self):
         a, b = normalize_event(event()), normalize_event(event(user=11))
         self.assertEqual(a["conversation_id"], b["conversation_id"])
@@ -62,6 +148,82 @@ class ProtocolTests(unittest.TestCase):
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_poke_uses_dedicated_action_and_void_success_receipt(self):
+        adapter = NapCatAdapter("ws://localhost")
+        requests = []
+        class Socket:
+            async def send(self, raw):
+                request = json.loads(raw)
+                requests.append(request)
+                adapter._pending[request["echo"]].set_result(dict(status="ok", retcode=0, data=None))
+        adapter._ws = Socket()
+        for request in (poke_command(), poke_command(group=None, target=99)):
+            result = await adapter._send(request, adapter._ws)
+            self.assertTrue(result["success"])
+            self.assertEqual(result["action"], "send_poke")
+            self.assertNotIn("message_id", result)
+            self.assertEqual(requests[-1]["action"], "send_poke")
+            self.assertEqual(requests[-1]["params"], request["params"])
+        self.assertFalse(adapter._pending)
+
+    async def test_poke_failure_timeout_and_filter_do_not_retry(self):
+        adapter = NapCatAdapter("ws://localhost", api_timeout=0.01, allowed_groups={20})
+        class Socket:
+            calls = 0
+            respond = True
+            async def send(self, raw):
+                self.calls += 1
+                if self.respond:
+                    adapter._pending[json.loads(raw)["echo"]].set_result(dict(
+                        status="failed", retcode=1200, message="packetBackend 不可用"))
+        ws = Socket()
+        adapter._ws = ws
+        self.assertEqual((await adapter._send(poke_command(group=21), ws))["status"], "not_sent")
+        self.assertEqual(ws.calls, 0)
+        self.assertEqual((await adapter._send(poke_command(), ws))["status"], "failed")
+        ws.respond = False
+        self.assertEqual((await adapter._send(poke_command(), ws))["status"], "unknown")
+        self.assertEqual(ws.calls, 2)
+        self.assertFalse(adapter._pending)
+
+    async def test_consecutive_pokes_without_unique_ids_are_not_dropped(self):
+        adapter = NapCatAdapter("ws://localhost")
+        emitted = []
+        adapter._emit = emitted.append
+        class Socket:
+            def __aiter__(self):
+                async def frames():
+                    for item in (poke_event(), poke_event(), event(), event()):
+                        yield json.dumps(item)
+                return frames()
+        await adapter._receive(Socket())
+        self.assertEqual([item["type"] for item in emitted], ["event"] * 4)
+        self.assertEqual([item["raw_event"] for item in emitted],
+                         [poke_event(), poke_event(), event(), event()])
+
+    async def test_structured_messages_and_optional_params_reach_napcat_unchanged(self):
+        adapter = NapCatAdapter("ws://localhost")
+        requests = []
+        class Socket:
+            async def send(self, raw):
+                request = json.loads(raw)
+                requests.append(request)
+                adapter._pending[request["echo"]].set_result(dict(status="ok", retcode=0, data={}))
+        adapter._ws = Socket()
+        for message in ([dict(type="at", data=dict(qq="all")),
+                         dict(type="image", data=dict(file="base64://test", custom="kept"))],
+                        dict(type="text", data=dict(text="单消息段")),
+                        "[CQ:at,qq=all]你好"):
+            request = command()
+            request["params"].update(message=message, auto_escape=False, source="来源")
+            result = await adapter._send(request, adapter._ws)
+            self.assertTrue(result["success"])
+            self.assertEqual(requests[-1]["params"], request["params"])
+        request = command()
+        request["params"]["group_id"] = 21
+        self.assertEqual((await adapter._send(request, adapter._ws))["status"], "not_sent")
+        self.assertEqual(len(requests), 3)
+
     async def test_ack_and_outbound_plain_text(self):
         adapter = NapCatAdapter("ws://localhost")
         class Socket:
@@ -127,7 +289,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         adapter._ws = object()
         self.assertEqual((await adapter._send(command(), object()))["status"], "not_sent")
 
-    async def test_event_dedup_and_echo(self):
+    async def test_each_frame_is_emitted_once_and_echo_is_separate(self):
         adapter = NapCatAdapter("ws://localhost")
         emitted = []
         adapter._emit = emitted.append
@@ -137,11 +299,12 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             def __aiter__(self):
                 async def frames():
                     for item in ("bad-json", json.dumps(event()), json.dumps(event()),
-                                 json.dumps(dict(echo="echo", status="ok", retcode=0))):
+                                 json.dumps(dict(echo="echo", status="ok", retcode=0)),
+                                 json.dumps(dict(echo="expired", status="failed", retcode=1404))):
                         yield item
                 return frames()
         await adapter._receive(Socket())
-        self.assertEqual(len(emitted), 1)
+        self.assertEqual([item["type"] for item in emitted], ["event", "event"])
         self.assertEqual(future.result()["status"], "ok")
 
     async def test_request_dedup_and_cached_receipt(self):
@@ -173,12 +336,47 @@ except ImportError:
 
 @unittest.skipIf(serve is None, "需要安装 websockets")
 class IPCIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_headless_poke_roundtrip_through_public_api_and_real_pipes(self):
+        from napcat_adapter.agent_api import ProcessClient
+        raw_notice = poke_event(group=None, sender=11)
+        requests = []
+        async def server(ws):
+            await ws.send(json.dumps(raw_notice))
+            request = json.loads(await ws.recv())
+            requests.append(request)
+            await ws.send(json.dumps(dict(echo=request["echo"], status="ok", retcode=0, data=None)))
+            await ws.wait_closed()
+        async with serve(server, "127.0.0.1", 0) as service:
+            url = f"ws://127.0.0.1:{service.sockets[0].getsockname()[1]}"
+            transport = await asyncio.to_thread(AdapterProcess, AdapterConfig(url=url, gui=False, group_only=False))
+            client = ProcessClient(transport=transport)
+            try:
+                deadline = asyncio.get_running_loop().time() + 4
+                batch = []
+                while not batch and asyncio.get_running_loop().time() < deadline:
+                    batch = client.napcat_receive()
+                    await asyncio.sleep(0.01)
+                self.assertEqual(len(batch), 1)
+                received = batch[0]
+                self.assertEqual(received["type"], "notice")
+                self.assertEqual(received["content"], raw_notice)
+                self.assertEqual(client.napcat_receive(), [])
+                result = json.loads(await asyncio.to_thread(client.send_poke, user_id="10", target_id="11"))
+                self.assertTrue(result["success"])
+                self.assertEqual(result["conversation_id"], "qq:private:10")
+                self.assertEqual(requests[0]["action"], "send_poke")
+                self.assertEqual(requests[0]["params"], dict(user_id="10", target_id="11"))
+            finally:
+                await asyncio.to_thread(client.close)
+
     async def test_real_subprocess_jsonl(self):
         received = []
+        raw_event = dict(event(), group_name="管道测试群", real_seq="123456",
+                         extension={"nested": [1, None, {"kept": True}]})
         peer_done = asyncio.Event()
         async def server(ws):
             self.assertEqual(ws.request.headers.get("Authorization"), "Bearer test-token")
-            await ws.send(json.dumps(event()))
+            await ws.send(json.dumps(raw_event))
             request = json.loads(await ws.recv())
             received.append(request)
             await ws.send(json.dumps(dict(echo=request["echo"], status="ok", retcode=0,
@@ -191,10 +389,15 @@ class IPCIntegrationTests(unittest.IsolatedAsyncioTestCase):
             try:
                 message = await asyncio.to_thread(transport.receive, 4)
                 self.assertEqual(message["conversation_id"], "qq:group:20")
-                result = await asyncio.to_thread(transport.send, message["conversation_id"], "中文回复")
+                self.assertEqual(message["raw_event"], raw_event)
+                params = dict(message_type="group", group_id=20, auto_escape=False,
+                              message=[dict(type="text", data=dict(text="中文回复")),
+                                       dict(type="at", data=dict(qq="10"))])
+                result = await asyncio.to_thread(transport.send_request, params)
                 self.assertEqual(result["message_id"], "789")
                 self.assertEqual(received[0]["params"]["group_id"], 20)
                 self.assertEqual(received[0]["params"]["message"][0]["data"]["text"], "中文回复")
+                self.assertEqual(received[0]["params"], params)
             finally:
                 peer_done.set()
                 await asyncio.to_thread(transport.close)

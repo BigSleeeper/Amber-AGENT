@@ -7,7 +7,8 @@ from collections import OrderedDict
 from pathlib import Path
 
 from .configuration import AdapterConfig
-from .protocol import parse_conversation, send_result
+from .protocol import (SYSTEM_CONVERSATION, command_preview, parse_conversation,
+                       send_result, validate_send_command)
 
 
 class Settings:
@@ -63,6 +64,7 @@ class PanelModel:
         self.incoming, self.outgoing = OrderedDict(), OrderedDict()
         self.results = OrderedDict()
         self.dropped = 0
+        self.discover(SYSTEM_CONVERSATION, "全部事件 / 通用 API")
 
     def discover(self, conversation, name=""):
         parse_conversation(conversation)
@@ -98,7 +100,9 @@ class PanelModel:
         conversation = event["conversation_id"]
         self.discover(conversation)
         if not self.enabled(conversation):
-            return
+            if not self.enabled(SYSTEM_CONVERSATION):
+                return
+            event = dict(event, conversation_id=SYSTEM_CONVERSATION)
         if not self._room(self.incoming):
             self.dropped += 1
             return
@@ -115,8 +119,8 @@ class PanelModel:
                 row["state"] = "delivered"
 
     def enqueue(self, command):
-        if not isinstance(command, dict) or command.get("type") != "send_message":
-            self.emit(dict(type="error", error="需要 send_message 命令"))
+        if not isinstance(command, dict) or command.get("type") not in ("send_message", "send_poke", "call_api"):
+            self.emit(dict(type="error", error="需要 send_message、send_poke 或 call_api 命令"))
             return
         key = command.get("request_id")
         if not isinstance(key, str) or not key:
@@ -128,10 +132,9 @@ class PanelModel:
         if key in self.outgoing:
             return
         try:
-            conversation = command.get("conversation_id")
+            conversation, params = validate_send_command(command)
+            command = dict(command, params=params, text=command_preview(command, params))
             self.discover(conversation)
-            if not isinstance(command.get("text"), str) or not command["text"].strip():
-                raise ValueError("消息不能为空")
             if not self._room(self.outgoing):
                 raise ValueError("发送列表已满，请先处理待发送消息")
             self.outgoing[key] = dict(event=dict(command), state="pending")

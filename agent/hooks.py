@@ -1,7 +1,7 @@
 import re
 
-from config import WORKDIR
-import utils
+from .config import WORKDIR
+from . import utils
 
 HOOKS = {
     "UserPromptSubmit": [], 

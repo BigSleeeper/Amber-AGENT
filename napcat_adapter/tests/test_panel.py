@@ -14,7 +14,8 @@ from unittest.mock import patch
 
 from napcat_adapter.panel_model import PanelModel, Settings
 from napcat_adapter.tests.test_agent_api import message
-from napcat_adapter.tests.test_adapter import command
+from napcat_adapter.tests.test_adapter import command, poke_command, poke_event
+from napcat_adapter.protocol import normalize_event
 from napcat_adapter.tests import test_ipc as ipc_fixtures
 from napcat_adapter.ipc import AdapterProcess
 from napcat_adapter.configuration import AdapterConfig
@@ -26,6 +27,87 @@ except ImportError:
 
 
 class PanelModelTests(unittest.TestCase):
+    def test_console_queues_native_calls_saves_frames_and_closes_cancelled_files(self):
+        from napcat_adapter.panel import Panel
+        from tkinter import ttk
+        root = tk.Tk()
+        root.withdraw()
+        panel = Panel(root, self.settings, self.events.append, auto_connect=False)
+        try:
+            panel.model.set_enabled(["qq:system:0"], True)
+            window = panel.open_api_console()
+            def widgets(parent):
+                for child in parent.winfo_children():
+                    yield child
+                    yield from widgets(child)
+            entries = [widget for widget in widgets(window) if isinstance(widget, ttk.Entry)
+                       and not isinstance(widget, ttk.Combobox)]
+            texts = [widget for widget in widgets(window) if isinstance(widget, tk.Text)]
+            button = next(widget for widget in widgets(window) if isinstance(widget, ttk.Button)
+                          and widget.cget("text") == "加入发送队列")
+            path = self.path.with_name("responses.jsonl")
+            entries[-1].insert(0, str(path))
+            entries[0].delete(0, "end")
+            entries[0].insert(0, "future_action")
+            texts[0].delete("1.0", "end")
+            texts[0].insert("1.0", '{"unknown": [false, null]}')
+            button.invoke()
+            request_id = next(iter(panel.local_api_requests))
+            self.assertEqual(panel.model.outgoing[request_id]["state"], "pending")
+            self.assertEqual(panel.model.outgoing[request_id]["event"]["params"], {"unknown": [False, None]})
+            record = panel.local_api_requests[request_id]
+            panel.events.put(dict(type="api_frame", request_id=request_id,
+                                  response=dict(stream="stream-action", data=dict(type="stream", data="YWJj"))))
+            panel.events.put(dict(type="send_result", request_id=request_id, status="ok", success=True,
+                                  raw_response=dict(status="ok", retcode=0, data=False)))
+            root.after_cancel(panel.timer)
+            panel.pump()
+            self.assertTrue(record["file"].closed)
+            self.assertFalse(panel.local_api_requests)
+            saved = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(saved[0]["data"]["data"], "YWJj")
+            self.assertIs(saved[1]["raw_response"]["data"], False)
+            entries[-1].delete(0, "end")
+            entries[-1].insert(0, str(self.path.with_name("cancelled.jsonl")))
+            button.invoke()
+            request_id = next(iter(panel.local_api_requests))
+            record = panel.local_api_requests[request_id]
+            panel.model.delete("send", [request_id])
+            self.assertTrue(record["file"].closed)
+            self.assertFalse(panel.local_api_requests)
+        finally:
+            panel.close()
+
+    def test_pokes_use_manual_receive_send_and_disable_policies(self):
+        self.enable()
+        notice = normalize_event(poke_event())
+        self.model.receive(notice)
+        self.assertFalse(self.events)
+        self.model.release_incoming(list(self.model.incoming))
+        self.assertEqual(self.events[-1]["type"], "notice")
+        self.assertEqual(self.events[-1]["raw_event"], notice["raw_event"])
+        self.model.enqueue(poke_command())
+        self.assertEqual(self.events[-1]["type"], "send_pending")
+        self.assertIn("戳一戳", self.model.outgoing["p1"]["event"]["text"])
+        self.assertFalse(self.submitted)
+        self.model.release_outgoing(["p1"])
+        self.assertEqual(self.submitted[0]["type"], "send_poke")
+        self.assertEqual(self.submitted[0]["params"], dict(user_id=10, group_id=20))
+        self.model.enqueue(poke_command("p2"))
+        self.model.set_enabled(["qq:group:20"], False)
+        self.assertEqual(self.model.outgoing["p2"]["state"], "not_sent")
+        self.assertEqual(self.model.outgoing["p1"]["state"], "sending")
+        self.model.shutdown()
+        self.assertEqual(self.model.outgoing["p1"]["state"], "unknown")
+
+    def test_deleting_a_queued_poke_returns_not_sent(self):
+        self.enable()
+        self.model.enqueue(poke_command())
+        self.model.delete("send", ["p1"])
+        self.assertEqual(self.events[-1]["status"], "not_sent")
+        self.assertEqual(self.events[-1]["action"], "send_poke")
+        self.assertFalse(self.submitted)
+
     def setUp(self):
         directory = Path(__file__).resolve().parents[1] / ".artifacts"
         directory.mkdir(exist_ok=True)
@@ -156,6 +238,44 @@ class PanelModelTests(unittest.TestCase):
         finally:
             panel.close()
 
+    def test_details_show_full_received_event_and_send_params(self):
+        from napcat_adapter.panel import Panel
+        root = tk.Tk()
+        root.withdraw()
+        panel = Panel(root, self.settings, self.events.append, auto_connect=False)
+        try:
+            panel.model.set_enabled(["qq:group:20"], True)
+            panel.model.receive(dict(message(), raw_event={
+                "sender": {"role": "admin"}, "unknown": {"nested": "完整扩展"}}))
+            outgoing = command()
+            outgoing["params"]["message"].append(dict(type="at", data=dict(qq="all")))
+            panel.model.enqueue(outgoing)
+            panel.refresh()
+            incoming_key = next(iter(panel.model.incoming))
+            panel.trees["receive"].selection_set(incoming_key)
+            panel.show_detail("receive")
+            self.assertIn("完整扩展", panel.details["receive"].get("1.0", "end"))
+            self.assertIn('"role": "admin"', panel.details["receive"].get("1.0", "end"))
+            panel.trees["send"].selection_set("r1")
+            panel.show_detail("send")
+            self.assertIn('"qq": "all"', panel.details["send"].get("1.0", "end"))
+            panel.model.release_incoming([incoming_key])
+            self.assertEqual(self.events[-1]["raw_event"]["unknown"]["nested"], "完整扩展")
+        finally:
+            panel.close()
+
+    def test_missing_params_and_conflicting_target_never_enter_send_queue(self):
+        self.enable()
+        invalid = command()
+        invalid["params"]["group_id"] = 21
+        self.model.enqueue(invalid)
+        self.assertEqual(self.events[-1]["status"], "not_sent")
+        self.model.enqueue(dict(type="send_message", request_id="legacy",
+                                conversation_id="qq:group:20", text="旧协议"))
+        self.assertEqual(self.events[-1]["status"], "not_sent")
+        self.assertFalse(self.model.outgoing)
+        self.assertFalse(self.submitted)
+
     def test_gui_eof_with_held_send_and_closed_parent_stdout_exits(self):
         self.settings.connection["url"] = "ws://127.0.0.1:1"
         self.enable()
@@ -239,13 +359,44 @@ class PanelModelTests(unittest.TestCase):
                 saved = Settings(self.path)
                 self.assertEqual(saved.napcat_config_path, str(path.resolve()))
                 self.assertEqual(saved.connection["url"], url)
-                self.assertFalse(saved.sessions)
+                self.assertEqual(set(saved.sessions), {"qq:system:0"})
+                self.assertFalse(saved.sessions["qq:system:0"]["enabled"])
                 self.assertEqual(saved.receive_mode, "manual")
                 self.assertNotIn(token, self.path.read_text(encoding="utf-8"))
                 self.assertIn("重启 NapCat", panel.setup_status.get())
                 panel.append_log(token)
                 self.assertNotIn(token, panel.log.get("1.0", "end"))
                 self.assertTrue(list(path.parent.glob("onebot11_*.json.*.bak")))
+                configured = json.loads(path.read_text(encoding="utf-8"))["network"]["websocketServers"][0]
+                self.assertTrue(configured["reportSelfMessage"])
+                self.assertTrue(configured["enableForcePushEvent"])
+        finally:
+            panel.close()
+
+    def test_auto_setup_surfaces_shadowed_template_without_writing_or_connecting(self):
+        from napcat_adapter.panel import Panel
+        account = self.path.with_name("onebot11_12345.json")
+        account.write_text('{"network":{"websocketServers":[]}}', encoding="utf-8")
+        template = self.path.with_name("onebot11.json")
+        original = '{"network":{"websocketServers":[]}}'
+        template.write_text(original, encoding="utf-8")
+        root = tk.Tk()
+        root.withdraw()
+        panel = Panel(root, self.settings, self.events.append, auto_connect=False)
+        try:
+            panel.napcat_path.set(str(template))
+            with patch.object(panel.network, "start") as start:
+                panel.setup_button.invoke()
+                deadline = time.monotonic() + 4
+                while panel.setup_running and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+                self.assertFalse(panel.setup_running)
+                self.assertEqual(str(panel.setup_button["state"]), "normal")
+                self.assertIn("账号配置", panel.setup_status.get())
+                self.assertEqual(template.read_text(encoding="utf-8"), original)
+                self.assertFalse(list(template.parent.glob("*.bak")))
+                start.assert_not_called()
         finally:
             panel.close()
 
@@ -539,38 +690,71 @@ class PanelProcessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gui_child_catalog_pipe_receive_send_and_exit(self):
         from napcat_adapter.tests.test_adapter import event
+        from napcat_adapter.protocol import received_item
         directory = Path(__file__).resolve().parents[1] / ".artifacts"
         directory.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=directory) as temporary:
             path = Path(temporary) / "panel.json"
             actions = []
+            poke_params = []
+            incoming = [event(), poke_event(), dict(event(user=99), post_type="message_sent", target_id=20),
+                        dict(post_type="request", request_type="friend", user_id=10, flag="request-flag"),
+                        dict(post_type="meta_event", meta_event_type="heartbeat", status={"online": True}),
+                        dict(post_type="future_event", extension=[False, None])]
             async def peer(ws):
-                await ws.send(json.dumps(event()))
+                for raw in incoming:
+                    await ws.send(json.dumps(raw))
                 async for raw in ws:
                     request = json.loads(raw)
                     action = request["action"]
                     actions.append(action)
+                    if action == "send_poke":
+                        poke_params.append(request["params"])
+                    if action == "download_file_stream":
+                        await ws.send(json.dumps(dict(echo=request["echo"], status="ok", retcode=0,
+                            stream="stream-action", data=dict(type="stream", data_type="file_chunk", data="YWJj"))))
                     data = {"get_group_list": [dict(group_id=20, group_name="测试群")],
                             "get_friend_list": [dict(user_id=10, nickname="测试好友")],
-                            "send_group_msg": dict(message_id=1234)}[action]
+                            "send_group_msg": dict(message_id=1234), "send_poke": None,
+                            "future_action": False, "download_file_stream": dict(type="response", total_bytes=3)}[action]
                     await ws.send(json.dumps(dict(echo=request["echo"], status="ok", retcode=0, data=data)))
             async with serve(peer, "127.0.0.1", 0) as service:
                 url = f"ws://127.0.0.1:{service.sockets[0].getsockname()[1]}"
                 settings = Settings(path, dict(url=url))
                 settings.sessions["qq:group:20"] = dict(enabled=True, name="")
+                settings.sessions["qq:system:0"] = dict(enabled=True, name="全部事件 / 通用 API")
                 settings.receive_mode = settings.send_mode = "auto"
                 settings.save()
                 with patch.dict(os.environ, NAPCAT_PANEL_CONFIG=str(path)):
                     transport = await asyncio.to_thread(AdapterProcess, AdapterConfig(url=url, gui=True))
                 try:
-                    received = await asyncio.to_thread(transport.receive, 5)
-                    self.assertEqual(received["text"], "你好")
-                    result = await asyncio.to_thread(transport.send, received["conversation_id"], "GUI管道回复")
+                    from napcat_adapter.agent_api import ProcessClient
+                    client = ProcessClient(transport=transport)
+                    received = []
+                    deadline = asyncio.get_running_loop().time() + 5
+                    while len(received) < len(incoming) and asyncio.get_running_loop().time() < deadline:
+                        received.extend(client.napcat_receive())
+                        await asyncio.sleep(0.01)
+                    self.assertEqual(received, [received_item(raw) for raw in incoming])
+                    self.assertEqual(client.napcat_receive(), [])
+                    result = await asyncio.to_thread(transport.send, "qq:group:20", "GUI管道回复")
                     self.assertEqual(result["message_id"], "1234")
+                    poke_result = json.loads(await asyncio.to_thread(client.send_poke, user_id=10, group_id=20))
+                    self.assertTrue(poke_result["success"])
+                    self.assertNotIn("message_id", poke_result)
+                    self.assertEqual(client.napcat_receive(), [])
+                    api_result = json.loads(await asyncio.to_thread(client.call_api, "future_action", {"extension": [False, None]}))
+                    self.assertIs(api_result["data"], False)
+                    frames = []
+                    stream_result = json.loads(await asyncio.to_thread(client.call_api, "download_file_stream", on_frame=frames.append))
+                    self.assertEqual(stream_result["data"]["total_bytes"], 3)
+                    self.assertEqual(frames[0]["data"]["data"], "YWJj")
                 finally:
                     await asyncio.to_thread(transport.close)
                 self.assertEqual(transport.process.returncode, 0)
                 self.assertEqual(actions.count("send_group_msg"), 1)
+                self.assertEqual(actions.count("send_poke"), 1)
+                self.assertEqual(poke_params, [dict(user_id=10, group_id=20)])
                 self.assertIn("get_group_list", actions)
                 self.assertIn("get_friend_list", actions)
                 saved = Settings(path)

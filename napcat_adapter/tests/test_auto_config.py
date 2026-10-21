@@ -4,10 +4,63 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from napcat_adapter.auto_config import SERVICE_NAME, configure_local, find_configs, saved_token
+from napcat_adapter.auto_config import SERVICE_NAME, configure_local, find_configs, saved_token, server_url
 
 
 class AutoConfigTests(unittest.TestCase):
+    def test_owned_service_upgrades_self_reporting_without_changing_token_or_port(self):
+        service = dict(name=SERVICE_NAME, enable=True, host="127.0.0.1", port=32001,
+                       messagePostFormat="array", reportSelfMessage=False, token="test-owned-token",
+                       enableForcePushEvent=True, debug=False, heartInterval=30000)
+        original = self.write(dict(network=dict(websocketServers=[service])))
+        result = configure_local(self.path)
+        self.assertTrue(result.changed)
+        self.assertEqual(result.backup.read_bytes(), original)
+        updated = json.loads(self.path.read_text(encoding="utf-8"))["network"]["websocketServers"][0]
+        self.assertTrue(updated["reportSelfMessage"])
+        self.assertEqual(updated["token"], service["token"])
+        self.assertEqual(updated["port"], service["port"])
+        self.assertFalse(configure_local(self.path).changed)
+
+    def test_incomplete_external_service_is_preserved_and_dedicated_service_is_added(self):
+        for overrides in (dict(reportSelfMessage=False), dict(enableForcePushEvent=False)):
+            service = dict(name="another-app", enable=True, host="127.0.0.1", port=3001,
+                           messagePostFormat="array", reportSelfMessage=True, enableForcePushEvent=True,
+                           token="test-other-token")
+            service.update(overrides)
+            self.write(dict(network=dict(websocketServers=[service])))
+            result = configure_local(self.path)
+            updated = json.loads(self.path.read_text(encoding="utf-8"))["network"]["websocketServers"]
+            self.assertTrue(result.changed)
+            self.assertEqual(updated[0], service)
+            self.assertEqual(len(updated), 2)
+            self.assertEqual(updated[1]["name"], SERVICE_NAME)
+            self.assertTrue(updated[1]["reportSelfMessage"])
+            self.assertTrue(updated[1]["enableForcePushEvent"])
+            self.assertNotEqual(updated[1]["port"], service["port"])
+
+    def test_localhost_is_not_forced_to_ipv4_and_saved_token_matches(self):
+        service = dict(name="existing", enable=True, host="localhost", port=32001,
+                       messagePostFormat="array", reportSelfMessage=True, token="test-local-token")
+        self.write(dict(network=dict(websocketServers=[service])))
+        self.assertEqual(server_url(service), "ws://localhost:32001")
+        result = configure_local(self.path)
+        self.assertFalse(result.changed)
+        self.assertEqual(result.url, "ws://localhost:32001")
+        self.assertEqual(saved_token(str(self.path), result.url), service["token"])
+        self.assertEqual(server_url(dict(host="::1", port=32001)), "ws://[::1]:32001")
+
+    def test_default_template_cannot_report_success_when_account_files_override_it(self):
+        self.write(dict(network=dict(websocketServers=[])))
+        template = self.directory / "onebot11.json"
+        original = '{"network":{"websocketServers":[]}}'
+        template.write_text(original, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "账号.*配置"):
+            configure_local(template)
+        self.assertEqual(template.read_text(encoding="utf-8"), original)
+        self.assertEqual(find_configs(str(template), roots=[self.directory]), [self.path.resolve()])
+        self.assertFalse(list(self.directory.glob("*.bak")))
+
     def setUp(self):
         root = Path(__file__).resolve().parents[1] / ".artifacts"
         root.mkdir(exist_ok=True)
@@ -49,7 +102,7 @@ class AutoConfigTests(unittest.TestCase):
 
     def test_reuse_existing_service_without_writing(self):
         service = dict(name="existing", enable=True, host="0.0.0.0", port=32000,
-                       messagePostFormat="array", token="existing-secret")
+                       messagePostFormat="array", reportSelfMessage=True, token="existing-secret")
         raw = self.write(dict(network=dict(websocketServers=[service])))
         result = configure_local(self.path)
         self.assertFalse(result.changed)
