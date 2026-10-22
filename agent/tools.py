@@ -360,11 +360,19 @@ ADVANCED_TOOLS.append({
     }
 })
 def run_send(message_type, qid, message):
-    send_message(
-        message_type=message_type,
-        user_id=qid,
-        message=message
-        )
+    if message_type == "private":
+        return send_message(
+            message_type="private",
+            group_id=qid,
+            message=message
+            )
+
+    if message_type == "private":
+        return send_message(
+            message_type="private",
+            group_id=qid,
+            message=message
+            )
 
 # 工具分发
 BASE_TOOL_HANDLERS = {

@@ -143,7 +143,7 @@ class PanelModel:
         except ValueError as exc:
             self.complete(send_result(command, "not_sent", error=str(exc)))
             return
-        self.emit(dict(type="send_pending", request_id=key))
+        self.emit(dict(type="send_pending", request_id=key, mode=self.settings.send_mode))
         if self.settings.send_mode == "auto":
             self.release_outgoing([key])
 

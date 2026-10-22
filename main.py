@@ -9,13 +9,19 @@ print("Amber-AGENT V0.0.1")
 
 def receive_QQ_message():
     events = napcat_receive()
+
+    # 无任何事件，返回 None
     if not events:
         return None
 
     text = []
     group_id = ""
+
+    # 依次收录各事件
     for event in events:
         raw = event["content"]
+
+        # 1.普通消息
         if event["type"] == "message":
             group_id = raw.get("group_id")          # 群号；临时私聊也可能附带来源群。
             user_id = raw.get("user_id")            # 发送者 QQ。
@@ -24,12 +30,28 @@ def receive_QQ_message():
             nickname = sender.get("nickname")       # 昵称
             text.append(f"{nickname}({user_id}): {raw_message}")
 
-    content = (
-        f"群聊 {group_id} 中最近50条消息：\n"
-        f"{"\n".join(text)}"
-    )
+        # 2.发送回执
+        elif event["type"] == "message_sent":
+            pass
 
-    return content
+        # 3.通知（戳一戳、撤回等）
+        elif event["type"] == "notice":
+            pass
+
+        # 4.请求（好友申请、加群申请等）
+        elif event["type"] == "request":
+            pass
+
+        # 5.连接与运行状态事件（心跳、生命周期）
+        elif event["type"] == "meta_event":
+            pass
+
+    if 
+        content = (
+            f"群聊 {group_id} 中最近50条消息：\n"
+            f"{"\n".join(text)}"
+        )
+        return content
 
 # 启动napcat适配器
 start_adapter()

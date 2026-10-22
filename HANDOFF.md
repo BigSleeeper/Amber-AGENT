@@ -2,20 +2,22 @@
 
 ## 当前摘要
 
-- 更新日期：2026-10-21（Asia/Shanghai）。当前工作：已完成初始开发阶段结束后的接手检查，并按用户授权给另一端 Codex 留下状态同步建议；以后续需求为准，不自动执行历史待办。
-- 当前基准：`main`，HEAD `40a82d4`（`good job`）；前序提交 `abed72d`（首次上传）、`68e3c2d`。检查开始时工作区干净，旧摘要中列出的入口、Agent、适配器、草稿和协作文档改动均已纳入当前提交，不再是未提交改动。HEAD 与本地 `origin/main` 引用差异为 `0 0`，本次未联网 fetch，不能据此确认服务器最新状态。
+- 更新日期：2026-10-22（Asia/Shanghai）。当前工作：普通 send_message 手动入队成功/自动真实回执已实现并通过 104 项适配器回归；随后按用户请求只读分析群聊上下文策略，提出每群隔离、群聊记录与工具工作上下文分离及滚动摘要方案，尚未实施，未修改 Agent/根入口。
+- 当前基准：`main`，HEAD `dc7679d`（`Update HANDOFF.md`）；前序提交 `40a82d4`（`good job`）、`abed72d`（首次上传）。检查开始时工作区干净；相比另一端上次检查的 `40a82d4`，仅 HANDOFF 有提交变更，功能代码未变。HEAD 与本地 `origin/main` 引用差异为 `0 0`，本次未联网 fetch，不能据此确认服务器最新状态。检查结束时仅 HANDOFF 有未提交更新。
 - 架构：根目录 `main.py` → Agent；Agent / 主程序通过匿名管道 JSONL 调用适配器子进程，适配器通过正向 WebSocket 连接 NapCat。当前 main 已轮询 QQ 事件并调用 Agent，不再是纯终端输入；接入仍有下述缺口，尚未完成端到端验收。
 - Agent 已有模型/工具循环、基础文件与命令工具、Todo、子代理工具、钩子、上下文压缩、记忆提取/整理；这些是代码能力，不代表本机运行已验收。`agent/` 完全由用户维护，本次仅只读检查。
-- 适配器已有群/私聊、戳一戳、完整事件接收、原生通用 API 及流式回执、GUI 会话管理/人工或自动放行、主题与配置保存、一键配置备份及服务选择。接收 `napcat_receive()` 无参数，批量返回 `[{"type": 枚举字符串, "content": 完整原始字典}]`，空队列为 `[]`；类型为 message、message_sent、notice、request、meta_event、unknown。普通发送显式填写类型/目标/message，可选参数透传；`send_message`、`send_poke` 和公共 `call_api` 仍返回 JSON 字符串，底层 `AdapterProcess.call_api` 返回字典。
+- 适配器已有群/私聊、戳一戳、完整事件接收、原生通用 API 及流式回执、GUI 会话管理/人工或自动放行、主题与配置保存、一键配置备份及服务选择。接收 `napcat_receive()` 无参数，批量返回 `[{"type": 枚举字符串, "content": 完整原始字典}]`，空队列为 `[]`；类型为 message、message_sent、notice、request、meta_event、unknown。普通发送显式填写类型/目标/message，可选参数透传；`send_message`、`send_poke` 和公共 `call_api` 仍返回 JSON 字符串，底层 `AdapterProcess.call_api` 返回字典。普通 send_message 手动成功入队返回 success=true/status=ok/mode=manual/queued=true/detail="已进入队列，等待人工发送"，不等待放行；自动模式与无界面模式仍返回真实结果。戳一戳、通用 API 保留等待执行结果的规则。
 - GUI 的“全部事件 / 通用 API”与群/私聊默认关闭，接收/发送默认手动；完整接口可接收心跳、自身消息等，事件单次入队，API 回执独立返回。队列有容量限制，不落盘恢复事件或待办；未知发送结果不自动重试。一键配置只写磁盘文件，不自动 WebUI 重载或重启 NapCat。
-- 当前接入问题（只提出建议，未修改）：`agent/tools.py:362` 的 `run_send` 对群聊仍填写 user_id 而缺 group_id，且未返回发送结果；工具 qid 枚举固定。`main.py:10` 将批次中不同会话合并、以最后一条 group_id 标记并共用 global_context，没有真正保存/截取最近 50 条；非空批次即使只有通知/心跳也会返回非空标题，从而触发 Agent；空队列持续忙轮询。建议用户按会话分流、过滤无消息批次、控制轮询频率，并正确映射目标和返回回执。
-- 本机环境：Python 3.12.10；可发现 websockets、tkinter、openai、dotenv、blessed，未发现 yaml（`agent/memory.py:3` 依赖它）。仅发现 tkinter 模块不等于 Tk 窗口可运行。未安装依赖、启动 Agent/GUI、调用模型、连接真实 NapCat 或操作实际配置。
-- 本次验证：32 个 Python 文件 AST 全部通过；26 项无 GUI 定向测试（test_auto_config、test_receive、ProcessApiTests）沙箱外全部通过。受限环境初测 26 项中 15 项通过、11 项受临时文件写入/清理权限影响（21 条 error，含清理错误），同一解释器沙箱外复核通过，不能认定为代码失败或对端问题。未运行全量测试及旧 Agent 集成测试。
-- 历史 GUI、91 项适配器回归和真实 NapCat 连接恢复结论来自另一台电脑，本机尚未复核，不可当作本机通过。旧 3 项 Agent 集成测试仍引用已删除 receive_message、根目录 tools.py 和旧导入桩，与当前接入不匹配。
+- 当前接入问题（只提出建议，未修改）：`agent/tools.py:362` 的 `run_send` 对群聊仍填写 user_id 而缺 group_id，导致校验阶段返回 not_sent；用户已自行补上 return，回执返回缺口已解决。工具 qid 枚举仍固定。`main.py:10` 将批次中不同会话合并、以最后一条 group_id 标记并共用 global_context，没有真正保存/截取最近 50 条；非空批次即使只有通知/心跳也会返回非空标题，从而触发 Agent；空队列持续忙轮询。建议用户按会话分流、过滤无消息批次、控制轮询频率，并按发送类型映射 group_id/user_id。
+- 最新未提交状态：用户维护的 agent/tools.py、其已跟踪 pyc、根 main.py 有变更，Codex 保留；本次变更为适配器 agent_api.py（接口说明）、panel_model.py（进度携带入队模式）、ipc.py（手动消息成功返回及防止迟到结果覆盖）、README、tests/test_panel.py 和新增 tests/test_send_modes.py。草稿发送示例及 README 同步回执语义，HANDOFF 更新。前述工作区干净、仅文档变更是本日较早检查时的快照。
+- 当前执行端环境（2026-10-22）：Python 3.12.10；可发现 websockets、tkinter、openai、dotenv、blessed、yaml。另一端 2026-10-21 的接手检查未发现 yaml，属于各端环境差异。模块可发现不等于实际运行验收；本次未安装依赖、启动 Agent/GUI、调用模型、连接真实 NapCat 或操作实际配置。
+- 本次验证（send_message 变更）：本会话执行端 Python 3.12.10，新增 7 项发送模式状态机测试先通过；随后沙箱外适配器范围 104 项全部通过，含实际 Tk GUI 子进程未连接 NapCat 时的手动入队立即返回、本地模拟 WebSocket 自动发送及高级调用。新增/修改的 6 个 Python 文件 AST 与范围 diff 空白检查通过。未运行旧 Agent 集成测试、模型或真实 QQ 业务；历史验证来源分开记录。
+- 验证来源：2026-10-21 的 GUI、91 项适配器回归和真实 NapCat 连接恢复记录来自本会话先前开发；26 项无 GUI 定向测试来自另一端接手机。2026-10-22 未复测 GUI 或当前 NapCat 连接，不把历史结果当成当前运行状态。旧 3 项 Agent 集成测试仍与当前接入不匹配，未自动修复。
 - 仓库卫生发现：Git 已跟踪 `agent/.env` 与两目录的 Python 字节码缓存。仅检查文件名，未读取 `.env` 内容；建议由用户确认敏感配置是否适合入库及后续忽略规则，未删除或改写文件。
 - 草稿目录已有发送、解析、戳一戳的逐字段分段示例，不要求整文件执行；发送片段含真实调用，不应作为检查脚本运行。根 README 仍仅名称及简介，适配器详细说明在 `napcat_adapter/README.md`。
-- 协作：两位开发者轮流开发，用户同步文件，通过 AGENTS/HANDOFF 交接；`napcat_adapter/` 由 Codex 按后续需求维护。此次仅更新 HANDOFF，未改功能代码、提交、推送、拉取或回退，保留现有工作区。
+- 协作：两位开发者轮流开发，用户同步文件，通过 AGENTS/HANDOFF 交接；`napcat_adapter/` 由 Codex 按需求维护。此次按用户授权实现手动/自动发送返回差异，未修改 agent/ 或根入口，未提交、推送、拉取或回退，保留用户改动。
 - 用户补充：代码提交可能由另一位开发者在 Codex 会话之外完成，`agent/` 也由用户或另一位开发者维护；任一端 Codex 都可能尚未观察到这些更新。交接是上次检查的快照，接手核对发现差异属于正常流程，不能仅据此判断同步失败。给另一端的具体建议见下节。
+- 群聊上下文方案（2026-10-22，仅建议）：按 group_id 分开维护近期原始消息、群摘要、已处理消息游标和未完成任务；按需临时组装模型上下文，避免反复追加重叠的最近 50 条。旧消息分批摘要，保留发言者/时间/引用和未解决问题；现有 ContextCompactor 继续压缩工具工作会话，不将其“50 条模型消息”等同于“50 条 QQ 消息”。queued=true 不算已发群消息，以实际自身上报确认并按消息编号合并；不把内部 assistant 结束语写成群聊发言。尚未授权实施 Agent 侧改造。
 
 ## 给另一端 Codex 的留言：状态同步建议（2026-10-21）
 
@@ -42,9 +44,13 @@
 
 ## 最近验证
 
-**本次接手机检查（2026-10-21，代码基准 `40a82d4`）：** Python 3.12.10，32 个 Python 文件 AST 通过；本机未发现 yaml，未启动 Agent。`python -B -m unittest napcat_adapter.tests.test_auto_config napcat_adapter.tests.test_receive napcat_adapter.tests.test_agent_api.ProcessApiTests -v` 在受限环境运行 26 项，15 项通过，11 项受临时目录写入/清理权限影响，产生 21 条 error；沙箱外用相同三个测试目标和 unittest.TestResult 汇总复核，26 项全部通过、无失败/错误/跳过。未运行全量测试、旧 Agent 集成、GUI 或真实 NapCat 连接；未调用模型。`git diff --check` 通过。
+**本会话发送返回改造（2026-10-22，基准 `dc7679d` 加当前适配器改动）：** `python -B -m unittest napcat_adapter.tests.test_send_modes napcat_adapter.tests.test_panel napcat_adapter.tests.test_ipc napcat_adapter.tests.test_agent_api.ProcessApiTests napcat_adapter.tests.test_receive napcat_adapter.tests.test_full_api napcat_adapter.tests.test_adapter napcat_adapter.tests.test_auto_config -q`，沙箱外 104 项通过，耗时约 10 秒。设置 PYTHONDONTWRITEBYTECODE=1，避免测试生成缓存；未运行旧 3 项 Agent 集成测试或任何 Agent/模型。真实 GUI 子进程只用临时设置和本地模拟服务，没有真实 QQ 消息操作。新增/修改的 6 个 Python 文件 AST、范围 git diff --check 通过。
 
-**以下为另一台电脑的历史验证：** 原文中的“本机”均指当时执行开发的电脑；当时基准主要是 `abed72d` 加彼时未提交改动，并非声称对 `40a82d4` 做过完整验收。保留历史结果作上下文，不适用于本次接手机环境。
+**本会话工作区检查（2026-10-22，代码基准 `dc7679d`）：** Python 3.12.10，32 个已跟踪 Python 文件 AST 通过；find_spec 可发现 websockets、tkinter、openai、dotenv、blessed、yaml。Git 核对发现相对 `40a82d4` 仅提交了交接文档，因此不重复功能回归；未启动 GUI/Agent、连接 NapCat 或调用模型。仅只读核对入口与发送工具，既有接入问题仍存在。git diff --check 通过。
+
+**另一端接手机检查（2026-10-21，代码基准 `40a82d4`）：** Python 3.12.10，32 个 Python 文件 AST 通过；该端未发现 yaml，未启动 Agent。`python -B -m unittest napcat_adapter.tests.test_auto_config napcat_adapter.tests.test_receive napcat_adapter.tests.test_agent_api.ProcessApiTests -v` 在受限环境运行 26 项，15 项通过，11 项受临时目录写入/清理权限影响，产生 21 条 error；沙箱外用相同三个测试目标和 unittest.TestResult 汇总复核，26 项全部通过、无失败/错误/跳过。未运行全量测试、旧 Agent 集成、GUI 或真实 NapCat 连接；未调用模型。`git diff --check` 通过。
+
+**以下为本会话 2026-10-21 的历史验证：** 原文中的“本机”均指当时执行开发的电脑，与上方另一端接手机的结果分开记录；当时基准主要是 `abed72d` 加彼时未提交改动，并非声称对 `40a82d4` 或 `dc7679d` 做过完整验收。不直接沿用为另一端或当前运行状态。
 
 **2026-10-21 实际连接修复验证：** 沙箱外本机 WebUI 登录、在线状态与账号配置匹配检查通过；字节一致备份后 SetConfig 返回 code=0。真实 websockets.connect 使用现有 Token 成功，收到生命周期事件；netstat 确认 3001 监听及现有 Python 客户端持续连接。没有发送 QQ 消息或调用模型。当前代码仅变更两处配置提示，静态语法及范围 diff 检查通过；未重复运行此前通过的完整回归。
 
@@ -75,11 +81,11 @@
 ## 待办与接手提示
 
 - 用户最新范围：先不考虑 Agent 集成；轮询入口已按用户要求改为 napcat_receive，返回列表且 content 为字典，普通发送不变。不得自动改动 Agent、追加高级工具注册或以旧 Agent 集成错误阻塞适配器维护。此前 receive_message/receive_event 及模型文本 content 用法已经过时。
-- 另一台电脑的现场连接曾修复，本机连接尚未验证。后续一键配置仍只修改文件，不自动调用 WebUI；新增或修改服务后需在 NapCat WebUI 重新读取并保存配置，或重启 NapCat。即使文件未变化，也不能以“匹配现有配置”推断运行服务已开启。接收会话或完整接口仍须启用，手动模式需放行。
+- 本会话 2026-10-21 的现场连接曾修复，另一端及当前运行状态未复核。后续一键配置仍只修改文件，不自动调用 WebUI；新增或修改服务后需在 NapCat WebUI 重新读取并保存配置，或重启 NapCat。即使文件未变化，也不能以“匹配现有配置”推断运行服务已开启。接收会话或完整接口仍须启用，手动模式需放行。
 - 通用协议与 GUI 通道已实现，真实 QQ 各业务/账号权限仍待具备实际环境时验证；通道可达不等同于全量真实业务验收，不应声称“所有接口已逐项实测”。
 - 接收列表会包含全部事件类型，尤其心跳、自身消息；调用方按 type 分支，不应当把每个 content 都当普通消息。无缺失字段补造、无模型文本自动组装，不自动回复或回戳；Agent 如需接入由用户自行维护。
 - 若后续处理 QQ 集成，先确认预期启动方式，再核对入口、收发工具注册、会话上下文管理、文档与集成测试；仅实现适配器侧授权范围内的工作，Agent 侧修改先提出建议，未经用户明确允许不得执行。单改测试路径不足以完成集成。
-- 本次待验证：本机 GUI/Tcl-Tk、实际 NapCat 配置/连接及真实业务；待用户明确需求后再执行。若受限环境出现权限或 init.tcl 错误，需区分执行环境限制与安装/代码问题，不能套用另一台电脑结论。
+- 按后续需求再验证各执行端 GUI/Tcl-Tk、当前 NapCat 配置/连接及真实业务；本次仅检查，不自动启动。若受限环境出现权限或 init.tcl 错误，需区分执行环境限制与安装/代码问题，不能套用另一台电脑结论。
 - 交接文件需随用户现有同步流程传至另一端才生效；尚未向另一台电脑的 Codex 直接发送消息。
 
 ## 交接记录
@@ -256,3 +262,38 @@
 - 已完成：在本文件新增留言，建议按当前工作区/Git 核对快照、固定摘要字段、标注验证执行端与基准，并保持 Agent 只读边界；保留已有交接改动。留言待用户同步文件后由另一端读取，未直接跨电脑通信。
 - 基准与验证：main / 40a82d4，开始时仅 HANDOFF 已有未提交改动；本次仅文档更新，执行 git diff --check，不重复运行功能测试。
 - 下一步：等待用户需求；建议不构成开发、修改 Agent 或 Git 提交/推送授权。
+
+### 2026-10-22 — 收到另一端留言后的工作区检查
+
+- 目标：只检查工作区。已读取 AGENTS/HANDOFF 及另一端的状态同步建议，核对实际 Git、入口和发送工具，保留人工变更。
+- 基准：main / dc7679d，检查开始时干净；最近提交仅更新 HANDOFF，功能代码与 40a82d4 一致。本地 origin/main 差异 0 0，未联网 fetch。没有提交、推送、拉取或回退。
+- 当前观察：适配器功能已提交，根入口已有 QQ 轮询；群聊发送工具缺 group_id/回执返回、批次混会话/元事件触发模型与忙轮询等记录仍适用。本次未修改 Agent、根入口或适配器。
+- 环境与验证：本会话执行端 Python 3.12.10，六项关键模块均可发现（含 yaml），与另一端缺 yaml 的记录分开。32 个已跟踪 Python 文件 AST、git diff --check 通过；首次 AST 枚举受 Git 中文文件名转义影响，改用 git ls-files -z 后全数通过，非源码错误。无功能变化，不重复回归，不启动模型/GUI或连接 NapCat。
+- 仓库仍跟踪 agent/.env 和 20 个 pyc，仅核对文件名/数量，未读取环境配置或改写缓存。实际变更只有 HANDOFF：更新当前基准、验证来源与本记录；结束时该文档未提交，等待用户下一项需求。
+
+### 2026-10-22 — 核对 send_message 返回值
+
+- 只读核对 agent_api、IPC、网络发送及 send_result；确认当前公共 send_message 返回 JSON 字符串，解析后以 success/status 判断结果，status 为 ok、failed、not_sent、unknown。正常收到原生回执时附 data/raw_response；message_id、error 等按实际情况出现，校验失败不含全部发送元数据。
+- 缺少 Python 必填关键字抛 TypeError，子进程启动异常也可能抛出；不能声称所有情况必然返回 JSON。人工待办会等待放行或删除，unknown 不自动重发。
+- 当前摘要已有返回类型说明，仍然适用。未修改功能代码、运行示例或发送消息，无需重复测试；仅补充本交接记录，保留已有文档改动。
+
+### 2026-10-22 — 群聊发送 not_sent 原因核对
+
+- 用户反馈群聊发送提示 group_id 必须填写。只读 AST 核对当前 run_send 与适配器校验：工具统一传 user_id=qid，群聊所需 group_id 缺失，请求在公共参数校验时拒绝，尚未进入人工发送队列；与手动模式无关。
+- 用户已自行给 run_send 补上 return，保留此未提交变更；建议仅在该函数按 message_type 分别填写 group_id 或 user_id。未修改 Agent、适配器或字节码缓存，未运行 Agent、模型或真实发送。
+- main / dc7679d；更新当前问题与未提交状态，检查交接 diff 空白，无需功能测试；不记录用户提供的实际群号或消息正文。
+
+### 2026-10-22 — 普通发送按手动/自动模式返回
+
+- 用户要求：手动模式返回发送成功状态，自动模式返回 NapCat 真实状态；并询问“等待人工发送”标注位置。已将说明置于 send_message 返回 JSON 的 detail 字段；手动成功入队返回 success=true、status=ok、mode=manual、queued=true，保留请求/会话编号，不伪造 message_id 或 raw_response。
+- PanelModel 的 send_pending 带当前 mode；IPC 对普通手动消息立即完成函数返回，GUI 仍是 pending，实际人工发送/删除/禁用/退出的结果继续在 GUI 更新。防止已完成返回被紧接而来的取消或关闭覆盖。未入队的无效参数、关闭会话、满队列仍 not_sent；入队时的模式决定此次返回语义。
+- 自动发送与无界面发送保持真实结果，send_poke/call_api 仍等待放行与真实回执，确保业务数据/流式终帧不丢失。缺少 mode 的旧进度帧保留原等待逻辑。
+- 新增 tests/test_send_modes.py 的 7 项覆盖群/私聊、无效/关闭/满队列、模式切换、真实自动结果、立即删除/关闭竞争和高级调用；test_panel 增加真实 GUI 子进程离线入队即返回测试。适配器范围 104 项全部通过，代码基准与命令见最近验证；未操作实际 QQ/模型。
+- 更新适配器接口说明、README 及草稿发送回执教学字段/注释，不改动 Agent 或根入口，不执行草稿。未提交或推送，用户既有改动保留；待后续需求，未自动改变会话启用或人工发送策略。
+
+### 2026-10-22 — 群聊上下文管理策略建议（未实施）
+
+- 用户请求构思群聊上下文管理策略。只读当前 main.py、agent/context.py 及 Agent/记忆函数组织；确认入口仍共享 global_context、批次合并与“最近50条”标题没有真实窗口，压缩器处理的是模型消息/工具结果，摘要提示偏编码任务。
+- 建议每群独立状态（近期原始聊天、群摘要、处理游标、未完成任务），模型每轮从快照组装群背景与新增消息，工具执行链在工作会话中完整保留；旧消息滚动摘要，兼顾数量和长度预算。聊天记录与长期记忆按群/用户范围管理，避免串群及重复灌入窗口。
+- 手动发送入队成功不等于已发送；queued=true 仅记为待发，实际自身消息上报后再记入群聊事实，按消息编号防止与自动发送回执重复。心跳等不作为发言，内部结束语不伪装成机器人已发言。
+- 本次仅方案说明及交接记录，未实现群聊上下文功能、修改 Agent/main 或运行模型/发送消息，保留所有既有代码改动。代码基准 main / dc7679d 加当前未提交改动；文档 diff 检查通过，不重复功能测试。

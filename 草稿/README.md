@@ -94,7 +94,8 @@ error = receipt.get("error")
 raw_response = receipt.get("raw_response")
 ~~~
 
-- ok：明确成功；failed：明确失败；not_sent：没有发送；unknown：结果不确定，不自动重发。
+- 普通 send_message 手动模式成功入队后立即返回 ok、success=true，附 queued=true、mode="manual" 和 detail="已进入队列，等待人工发送"。GUI 仍需人工放行，之后的实际结果或删除状态在 GUI 查看，不改变已返回结果。
+- 自动模式的 ok 表示真实发送成功；failed：明确失败；not_sent：没有发送；unknown：结果不确定，不自动重发。参数错误、会话关闭或队列已满时，手动模式也返回 not_sent。send_poke / call_api 仍等待真实结果。
 - success、status 是当前发送回执的公共字段；其他字段不保证都存在，不能按此前的“固定字段”建议假定已经实现。
 - 有网络响应时 raw_response 保留原生 status、retcode、data、echo、wording 等及未知扩展。原生 data 可以为 null、false、0 或其他结构，不要强制当字典。
 - 本地参数无效返回 not_sent；缺少 Python 必填关键字参数直接抛 TypeError，此时没有回执可供 json.loads()。

@@ -75,8 +75,11 @@ result = send_message(
 
 # 6. 解析任意一次调用的返回值。result 是 JSON 字符串，不是字典。
 receipt = json.loads(result)
-success = receipt["success"]              # 布尔值，发送是否明确成功。
+success = receipt["success"]              # 布尔值；手动模式表示入队成功，自动模式表示真实发送成功。
 status = receipt["status"]                # ok / failed / not_sent / unknown。
+queued = receipt.get("queued", False)     # True：普通消息已入人工队列，尚未确认发送。
+mode = receipt.get("mode")               # 手动入队成功时为 manual；其他结果可能没有。
+detail = receipt.get("detail")            # 手动入队成功时为“已进入队列，等待人工发送”。
 request_id = receipt.get("request_id")     # 适配器自动生成的请求编号。
 conversation_id = receipt.get("conversation_id")  # 目标会话标识。
 message_id = receipt.get("message_id")     # 成功回执可能携带的新消息编号。
@@ -100,6 +103,7 @@ if isinstance(raw_response, dict):
 # 进入实际发送流程的回执还包含 type="send_result"。
 # 本地参数校验失败的回执可能只有 success、status、error，故可选字段用 get。
 # 缺少 Python 必填关键字参数会直接抛 TypeError，此时没有 JSON 回执可供解析。
-# ok：明确成功；failed：NapCat 明确失败；not_sent：没有发送；unknown：结果未知。
-# unknown 不自动重发。GUI 手动发送模式会等待界面人工放行。
+# ok：手动模式入队成功，或自动模式真实发送成功；failed：NapCat 明确失败。
+# not_sent：没有发送；unknown：结果未知，不自动重发。
+# 手动普通发送入队后立即返回，实际发送仍需界面人工放行，结果在 GUI 查看。
 # 这里只解析示例中某次 result；有多次实际发送时，应分别保存和处理各自回执。

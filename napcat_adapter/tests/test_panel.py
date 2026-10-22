@@ -657,6 +657,31 @@ for line in sys.stdin:
 
 @unittest.skipIf(serve is None, "需要安装 websockets")
 class PanelProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_gui_child_returns_queue_success_without_napcat(self):
+        from napcat_adapter.agent_api import ProcessClient
+        directory = Path(__file__).resolve().parents[1] / ".artifacts"
+        directory.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=directory) as temporary:
+            path = Path(temporary) / "panel.json"
+            settings = Settings(path, dict(url="ws://127.0.0.1:1"))
+            settings.sessions["qq:group:20"] = dict(enabled=True, name="测试群")
+            settings.save()
+            with patch.dict(os.environ, NAPCAT_PANEL_CONFIG=str(path)):
+                transport = await asyncio.to_thread(AdapterProcess, AdapterConfig(gui=True))
+            try:
+                client = ProcessClient(transport=transport)
+                result = json.loads(await asyncio.wait_for(asyncio.to_thread(
+                    client.send_message, message_type="group", group_id=20, message="人工待办"), 3))
+                self.assertTrue(result["success"])
+                self.assertEqual(result["status"], "ok")
+                self.assertTrue(result["queued"])
+                self.assertEqual(result["mode"], "manual")
+                self.assertNotIn("raw_response", result)
+                self.assertFalse(transport._pending)
+            finally:
+                await asyncio.to_thread(transport.close)
+            self.assertEqual(transport.process.returncode, 0)
+
     async def test_disconnect_completes_released_send_without_ack(self):
         from napcat_adapter.panel import Network
         received = asyncio.Event()

@@ -124,6 +124,13 @@ class AdapterProcess:
             elif kind in ("send_pending", "send_started"):
                 pending = self._pending.get(event.get("request_id"))
                 if pending is not None:
+                    if (kind == "send_pending" and event.get("mode") == "manual"
+                            and pending[2]["type"] == "send_message" and not pending[0].is_set()):
+                        # 普通消息以人工队列受理作为成功；GUI 继续保留待办并记录真实结果。
+                        result = send_result(pending[2], "ok")
+                        result.update(mode="manual", queued=True, detail="已进入队列，等待人工发送")
+                        pending[1].update(result)
+                        pending[0].set()
                     timeout = event.get("timeout", self.config.send_timeout)
                     if not isinstance(timeout, (float, int)) or not math.isfinite(timeout) or timeout <= 0:
                         timeout = self.config.send_timeout
@@ -133,7 +140,7 @@ class AdapterProcess:
                 request_id = event.get("request_id")
                 if isinstance(request_id, str):
                     pending = self._pending.get(request_id)
-                    if pending is not None:
+                    if pending is not None and not pending[0].is_set():
                         pending[1].update(event)
                         pending[0].set()
             elif kind == "error":
@@ -250,7 +257,7 @@ class AdapterProcess:
                     batch = list(frames)
                     frames.clear()
                     finished = ready.is_set()
-                    if self._closing:
+                    if self._closing and not finished:
                         return send_result(command, "unknown", error="适配器正在退出，发送结果未知；不要自动重发")
                     deadline = progress["deadline"]
                     remaining = None if deadline is None else deadline - time.monotonic()

@@ -66,14 +66,16 @@ python main.py
 
 | 操作 | 接收列表 | 发送列表 |
 | --- | --- | --- |
-| 手动模式 | 消息等待人工处理 | Agent 请求等待人工处理，发送工具也会等待 |
+| 手动模式 | 消息等待人工处理 | 普通消息入队后向调用方返回成功，消息继续等待人工发送 |
 | 接收 / 发送选中 | 将选中待办交给 Agent | 将选中待办交给 NapCat |
 | 自动模式 | 启用会话的消息直接交给 Agent | 启用会话的发送请求直接交给 NapCat |
-| 删除选中 | 待办不会交给 Agent | 待办返回 `not_sent`，解除工具等待 |
+| 删除选中 | 待办不会交给 Agent | GUI 记录为 `not_sent`；已返回的普通消息入队成功结果不变 |
 
 切换为自动模式会立即放行已有待办。已交给 Agent 的消息无法撤回；发送中的消息不能删除取消；删除已完成记录仅清理界面历史。列表各保留最多 500 条，优先淘汰已完成记录，待办占满时拒绝新增消息；接收丢弃数显示在顶部。
 
-人工排队时暂停发送超时，真正开始发送后才计算 NapCat 接口超时。断线或超时返回 `unknown`，不自动重发。当前 Agent 串行运行，因此等待人工发送 / 删除时，该次 Agent 调用也会等待。
+普通 `send_message()` 在手动模式成功入队后立即返回 `success=true, status="ok"`，并附 `mode="manual"`、`queued=true` 和 `detail="已进入队列，等待人工发送"`。这表示队列受理成功；GUI 仍显示“等待放行”，人工发送后的真实结果或后续删除、关闭会话等结果继续显示在 GUI，不再更改已经返回的结果。参数错误、目标会话未启用或队列已满时仍返回 `not_sent`；断线时可以先存入人工队列。
+
+自动模式的普通发送，以及 `send_poke()` / `call_api()`，继续等待执行结果；人工等待的高级调用暂停发送超时，真正开始发送后才计算 NapCat 接口超时。发送中断线或超时为 `unknown`，不自动重发。模式以请求成功入队时的设置为准，切换模式不追溯修改已经返回的入队成功结果。
 
 ## 聊天配置
 
@@ -140,7 +142,9 @@ for event in events:
 
 `message` 支持非空字符串、单个消息段或非空消息段数组，数组内每段须有非空 `type` 与 `data` 对象。消息段及可选参数保持完整传给 NapCat，不转换成纯文本；具体消息段的业务字段和媒体支持由 NapCat 校验和执行。`auto_escape` 可选，默认按 NapCat 的 `false` 语义处理字符串中的 CQ 码；需要将字符串作为纯文本时传 `auto_escape=True`，或使用 `text` 消息段。其他 NapCat 发送选项（例如合并转发的 `source`、`news`、`summary`、`prompt`）可通过关键字传入。适配器不填写消息上报中的 `sender`、`time`、`message_id`，这些不是普通发送请求的必填参数。依据 [NapCat 官方发送实现](https://github.com/NapNeko/NapCatQQ/blob/main/packages/napcat-onebot/action/msg/SendMsg.ts)。
 
-发送结果仍为 JSON 字符串，仍受启用会话、人工放行和发送回执规则约束。接收的 `content` 是字典；如需模型文本由调用方按需转换，适配器不组装模型角色或会话历史。普通 assistant 文本不自动发送。适配器不导入 Agent 或修改其提示词、工具和权限逻辑。
+发送结果仍为 JSON 字符串。手动模式成功入队返回 `success=true, status="ok", queued=true, mode="manual"`，`detail` 说明等待人工发送；这时没有 NapCat 回执或消息编号。自动模式等待真实执行结果，`raw_response`、`data` 保留 NapCat 回执，外层 `status` 为 `ok`、`failed`、`not_sent` 或 `unknown`。可通过 `receipt.get("queued") is True` 区分入队成功与真实发送结果。无界面模式没有人工队列，继续返回真实执行结果。
+
+接收的 `content` 是字典；如需模型文本由调用方按需转换，适配器不组装模型角色或会话历史。普通 assistant 文本不自动发送。适配器不导入 Agent 或修改其提示词、工具和权限逻辑。
 
 ### 戳一戳
 
@@ -186,7 +190,7 @@ for event in napcat_receive():
 | `NAPCAT_API_TIMEOUT` | `15` | NapCat 回执超时秒数 |
 | `NAPCAT_RECONNECT_DELAY` | `3` | 断线重连间隔秒数 |
 | `NAPCAT_REQUIRE_AT` | `0` | 兼容旧配置，统一接收不再按 @ 过滤 |
-| `NAPCAT_SEND_TIMEOUT` | API 超时 + 5 秒 | 父进程发送等待秒数，人工排队时暂停，GUI 实际发送时采用界面 API 超时 + 5 秒 |
+| `NAPCAT_SEND_TIMEOUT` | API 超时 + 5 秒 | 父进程发送等待秒数；普通手动发送仅等待入队确认，高级调用人工排队时暂停，GUI 实际发送时采用界面 API 超时 + 5 秒 |
 | `NAPCAT_STARTUP_TIMEOUT` | `10` | 子进程就绪超时秒数 |
 | `NAPCAT_INBOX_CAPACITY` | `500` | 父进程已放行消息队列容量 |
 
@@ -213,12 +217,14 @@ stdout 仅输出 JSON 行，日志写 stderr。就绪与消息事件：
 
 ```json
 {"type":"send_message","request_id":"req-001","conversation_id":"qq:group:123456","params":{"message_type":"group","group_id":123456,"message":[{"type":"text","data":{"text":"大家好"}}]}}
-{"type":"send_pending","request_id":"req-001"}
+{"type":"send_pending","request_id":"req-001","mode":"manual"}
 {"type":"send_started","request_id":"req-001","timeout":20}
 {"type":"send_result","request_id":"req-001","conversation_id":"qq:group:123456","success":true,"status":"ok","message_id":"999"}
 ```
 
 最终 `status` 为 `ok`、`failed`、`not_sent` 或 `unknown`。结果未知不自动重发。使用 `{"type":"shutdown"}` 或关闭 stdin 停止子进程。
+
+上述为子进程输出的原始生命周期。Python `send_message()` 收到 `mode="manual"` 的 `send_pending` 时立即返回入队成功 JSON，保留 request_id/conversation_id 并附 queued/mode/detail，不再等待后续原始 send_result；后续结果只更新 GUI。自动模式的 send_pending 带 `mode="auto"`，函数继续等待 send_result。旧进度帧缺少 mode 时仍沿用等待最终回执的语义；戳一戳和通用 API 的等待规则不变。
 
 发送命令的 `params` 必须包含完整的目标与消息参数，且与 `conversation_id` 一致。旧的仅包含 `text` 的发送命令会被拒绝；GUI 中的 `text` 仅为从完整 `message` 派生的预览，完整发送参数在详情中显示。WebSocket 的 action 与 echo 由适配器生成，分别使用 `send_group_msg` 或 `send_private_msg`。
 

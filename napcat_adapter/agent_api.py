@@ -23,6 +23,7 @@ class ProcessClient:
         return self.transport.napcat_receive()
 
     def send_message(self, *, message_type, message, group_id=None, user_id=None, **options):
+        """手动模式入队即返回成功；自动模式返回 NapCat 执行结果，均为 JSON 字符串。"""
         params = dict(options, message_type=message_type, message=message)
         if group_id is not None:
             params["group_id"] = group_id
@@ -91,7 +92,7 @@ def napcat_receive() -> list[dict]:
 
 
 def send_message(*, message_type, message, group_id=None, user_id=None, **options):
-    """按 NapCat 参数显式指定目标与消息，返回 JSON 字符串供工具结果使用。"""
+    """返回 JSON 字符串：手动入队成功为 ok/queued，自动模式等待 NapCat 真实回执。"""
     params = dict(options, message_type=message_type, message=message)
     if group_id is not None:
         params["group_id"] = group_id
