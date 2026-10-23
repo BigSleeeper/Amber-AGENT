@@ -14,21 +14,28 @@ def receive_QQ_message():
     if not events:
         return None
 
+
     text = []
     group_id = ""
 
-    # 依次收录各事件
+    # 依次解析所有事件
     for event in events:
         raw = event["content"]
 
         # 1.普通消息
         if event["type"] == "message":
-            group_id = raw.get("group_id")          # 群号；临时私聊也可能附带来源群。
-            user_id = raw.get("user_id")            # 发送者 QQ。
-            raw_message = raw.get("raw_message")    # 原始消息文本，可能含 CQ 码。
-            sender = raw.get("sender")
-            nickname = sender.get("nickname")       # 昵称
-            text.append(f"{nickname}({user_id}): {raw_message}")
+            # 私聊消息，后续再完善
+            if raw["message_type"] == "private":
+                pass
+
+            # 群聊消息
+            elif raw["message_type"] == "group":
+                group_id = raw.get("group_id")          # 群号；临时私聊也可能附带来源群。
+                user_id = raw.get("user_id")            # 发送者 QQ。
+                raw_message = raw.get("raw_message")    # 原始消息文本，可能含 CQ 码。
+                sender = raw.get("sender")
+                nickname = sender.get("nickname")       # 昵称
+                text.append(f"{nickname}({user_id}): {raw_message}")
 
         # 2.发送回执
         elif event["type"] == "message_sent":
@@ -41,17 +48,18 @@ def receive_QQ_message():
         # 4.请求（好友申请、加群申请等）
         elif event["type"] == "request":
             pass
-
         # 5.连接与运行状态事件（心跳、生命周期）
         elif event["type"] == "meta_event":
             pass
 
-    if 
+    if text:
         content = (
-            f"群聊 {group_id} 中最近50条消息：\n"
+            f"新消息：\n"
             f"{"\n".join(text)}"
         )
         return content
+
+    return None
 
 # 启动napcat适配器
 start_adapter()

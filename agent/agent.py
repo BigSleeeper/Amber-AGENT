@@ -10,8 +10,8 @@ from .memory import *
 # 核心AGENT循环
 agent_cnt = [0,0]
 def agent_loop(messages:list, active_request: str):
-    relevant_memories = load_memories(messages)
-    system = build_system(relevant_memories)
+    #relevant_memories = load_memories(messages)
+    #system = build_system(relevant_memories)
 
     global agent_cnt
     rounds_since_todo = 0
